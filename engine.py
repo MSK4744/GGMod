@@ -1,0 +1,1076 @@
+"""Core trainer engine for GGMod.
+
+Real memory logic: AOB scanning, hard-freeze (continuous overwrite) and
+pointer-capture (code-cave) mod templates.
+
+This module must NOT import tkinter. All user-facing messages go through
+the log_callback passed into __init__ so the UI stays decoupled from logic.
+
+NOTE ON TESTING: the memory routines below cannot be exercised against a
+real game from this dev box; they are written to be correct-by-construction
+and are meant to be validated manually against POP.exe / PRAGMATA. Places
+where a live game is required to confirm behaviour are called out in
+comments and surfaced via the log callback.
+"""
+
+import ctypes
+import json
+import struct
+import threading
+import time
+from ctypes import wintypes
+
+import pymem
+
+# ---------------------------------------------------------------------------
+# Win32 bindings we need beyond what pymem exposes conveniently.
+# ---------------------------------------------------------------------------
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+_kernel32.VirtualAllocEx.restype = wintypes.LPVOID
+_kernel32.VirtualAllocEx.argtypes = [
+    wintypes.HANDLE, wintypes.LPVOID, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD
+]
+_kernel32.VirtualProtectEx.restype = wintypes.BOOL
+_kernel32.VirtualProtectEx.argtypes = [
+    wintypes.HANDLE, wintypes.LPVOID, ctypes.c_size_t, wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+]
+
+MEM_COMMIT = 0x1000
+MEM_RESERVE = 0x2000
+PAGE_EXECUTE_READWRITE = 0x40
+
+# Cave layout: first bytes are the "shared slot" the cave writes the captured
+# pointer into; code starts further in (aligned) so we never overlap the slot.
+_SLOT_OFF = 0
+_CODE_OFF = 16
+_CAVE_SIZE = 256
+
+# ModRM reg-field codes. The same low-3-bit code is used for the e** and r**
+# names; the r8-r15 names set REX.R. Width is decided by process bitness, not
+# by whether the caller wrote "esi" vs "rsi".
+_REG_CODES = {
+    "eax": 0, "ecx": 1, "edx": 2, "ebx": 3, "esp": 4, "ebp": 5, "esi": 6, "edi": 7,
+    "rax": 0, "rcx": 1, "rdx": 2, "rbx": 3, "rsp": 4, "rbp": 5, "rsi": 6, "rdi": 7,
+    "r8": 8, "r9": 9, "r10": 10, "r11": 11, "r12": 12, "r13": 13, "r14": 14, "r15": 15,
+}
+
+
+class JmpOutOfRangeError(Exception):
+    """Raised when a rel32 jmp offset does not fit in signed 32 bits.
+
+    Signals that a cave was allocated further from its hook than a 5-byte
+    E9 rel32 can reach — an abort condition, not a crash. Carries the jmp
+    target address and the computed (out-of-range) relative offset.
+    """
+
+    def __init__(self, dst_addr, rel):
+        self.dst_addr = dst_addr
+        self.rel = rel
+        super().__init__(
+            "jmp target {:#x} out of rel32 range (rel={})".format(dst_addr, rel)
+        )
+
+
+def _parse_int(value, default=0):
+    """Parse an int that may be given as an int or a hex/dec string."""
+    if value is None:
+        return default
+    if isinstance(value, int):
+        return value
+    return int(str(value), 0)  # base 0 handles "0x10" and "16"
+
+
+class TrainerEngine:
+    def __init__(self, log_callback=None):
+        self._log = log_callback if log_callback else (lambda msg: None)
+        self.pm = None                # pymem.Pymem handle when attached
+        self.process_name = None      # name of the attached process
+        self.mods = []                # loaded mod definitions
+        self.config_path = None       # path the current config was loaded from
+        self.config_data = None       # full parsed config dict (for re-saving)
+        self._is64 = False            # target process is 64-bit
+
+        # Registry of currently-active mods, keyed by mod name. Each entry:
+        #   {
+        #     "stop": threading.Event,
+        #     "thread": threading.Thread,
+        #     "patches": [(address, original_bytes), ...],  # to restore
+        #     "cave": <address or None>,                     # to free
+        #     "kind": "hard_freeze" | "pointer_capture",
+        #   }
+        self._active = {}
+
+    # ==================================================================
+    # Process attach / detach
+    # ==================================================================
+    def attach(self, process_name: str) -> bool:
+        """Attach to a running process by name."""
+        try:
+            self.pm = pymem.Pymem(process_name)
+        except pymem.exception.ProcessNotFound:
+            self._log("Could not find process: '{}'".format(process_name))
+            self.pm = None
+            self.process_name = None
+            return False
+        except Exception as exc:
+            self._log("Failed to attach to '{}': {}".format(process_name, exc))
+            self.pm = None
+            self.process_name = None
+            return False
+
+        self.process_name = process_name
+        # is_WoW64 True => a 32-bit process running under WOW64 on 64-bit
+        # Windows. Treat anything that is NOT WoW64 as 64-bit. (On a 32-bit
+        # OS this would misreport, but GGMod targets modern 64-bit Windows.)
+        try:
+            self._is64 = not bool(self.pm.is_WoW64)
+        except Exception:
+            self._is64 = True
+        self._log(
+            "Attached to '{}' (pid {}, {}).".format(
+                process_name, self.pm.process_id, "x64" if self._is64 else "x86"
+            )
+        )
+        return True
+
+    def detach(self):
+        """Stop all mods, restore patched bytes, free caves, then close."""
+        if self.pm is None:
+            self._log("Not attached; nothing to detach.")
+            return
+
+        for name in list(self._active.keys()):
+            self._teardown_mod(name)
+
+        try:
+            self.pm.close_process()
+            self._log("Detached from '{}'.".format(self.process_name))
+        except Exception as exc:
+            self._log("Error while detaching: {}".format(exc))
+        finally:
+            self.pm = None
+            self.process_name = None
+            self._active = {}
+
+    # ==================================================================
+    # Config loading
+    # ==================================================================
+    def load_game_config(self, json_path: str):
+        try:
+            with open(json_path, "r", encoding="utf-8") as fh:
+                config = json.load(fh)
+        except FileNotFoundError:
+            self._log("Config file not found: {}".format(json_path))
+            return
+        except json.JSONDecodeError as exc:
+            self._log("Invalid JSON in config: {}".format(exc))
+            return
+
+        self.mods = config.get("mods", [])
+        # Remember the file + full parsed dict so save_mod_config can write it
+        # back later, preserving process_name / notes / other mods untouched.
+        self.config_path = json_path
+        self.config_data = config
+        self.config_data["mods"] = self.mods   # share the same list object
+        cfg_process = config.get("process_name", "<unknown>")
+        self._log(
+            "Loaded config for '{}': {} mod(s).".format(cfg_process, len(self.mods))
+        )
+
+    def save_mod_config(self, name=None):
+        """Write the current in-memory mods list back to the JSON file it was
+        loaded from, preserving every other field. `name` is optional and used
+        only to validate the mod exists (the whole list is written regardless).
+        Returns True on success. Never called automatically — only on explicit
+        'Save to Config'.
+        """
+        if not self.config_path or self.config_data is None:
+            self._log("save_mod_config: no config loaded.")
+            return False
+        if name is not None and not any(m.get("name") == name for m in self.mods):
+            self._log("save_mod_config: no mod named '{}'.".format(name))
+            return False
+        self.config_data["mods"] = self.mods   # ensure current list is written
+        try:
+            with open(self.config_path, "w", encoding="utf-8") as fh:
+                # ensure_ascii=False keeps note fields' UTF-8 (em-dashes etc.)
+                # literal, so we don't rewrite them as \uXXXX escapes.
+                json.dump(self.config_data, fh, indent=2, ensure_ascii=False)
+        except OSError as exc:
+            self._log("save_mod_config: write failed: {}".format(exc))
+            return False
+        return True
+
+    # ==================================================================
+    # Low-level memory helpers
+    # ==================================================================
+    def _main_module_range(self):
+        """Return (base_address, size) of the main executable module."""
+        base = self.pm.base_address
+        try:
+            for module in self.pm.list_modules():
+                if int(module.lpBaseOfDll) == int(base):
+                    return int(base), int(module.SizeOfImage)
+            # Fall back to the first module (the main exe is normally first).
+            first = next(iter(self.pm.list_modules()))
+            return int(first.lpBaseOfDll), int(first.SizeOfImage)
+        except Exception as exc:
+            self._log("Could not determine module size: {}".format(exc))
+            return int(base), 0
+
+    def _read(self, address, size):
+        try:
+            return self.pm.read_bytes(address, size)
+        except Exception:
+            return None
+
+    def _write(self, address, data):
+        self.pm.write_bytes(address, bytes(data), len(data))
+
+    def _make_rwx(self, address, size):
+        """Force a region to RWX so we can patch code. Returns old protect."""
+        old = wintypes.DWORD(0)
+        ok = _kernel32.VirtualProtectEx(
+            self.pm.process_handle, ctypes.c_void_p(address), size,
+            PAGE_EXECUTE_READWRITE, ctypes.byref(old),
+        )
+        if not ok:
+            self._log("VirtualProtectEx failed at {:#x}".format(address))
+        return old.value
+
+    # ------------------------------------------------------------------
+    # AOB scanning
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_aob(aob_pattern):
+        """Parse 'AA BB ?? DD' into (pattern_bytes, mask) where mask[i] is
+        True for a fixed byte and False for a wildcard."""
+        pattern = []
+        mask = []
+        for token in aob_pattern.split():
+            if token in ("??", "?"):
+                pattern.append(0)
+                mask.append(False)
+            else:
+                pattern.append(int(token, 16))
+                mask.append(True)
+        return bytes(pattern), mask
+
+    @staticmethod
+    def _ts():
+        """Wall-clock HH:MM:SS.mmm timestamp for diagnostic log lines."""
+        now = time.time()
+        return time.strftime("%H:%M:%S", time.localtime(now)) + \
+            ".{:03d}".format(int((now % 1) * 1000))
+
+    def scan_aob(self, aob_pattern, progress_callback=None):
+        """Scan the main module and return ALL addresses matching the pattern.
+
+        Reads in overlapping chunks so matches that straddle a chunk boundary
+        are still found, and so we never pull the whole module into memory at
+        once.
+
+        progress_callback(offset, size), if given, is invoked during the scan
+        (throttled to ~1 MB of progress) so the UI can show a progress bar. It
+        runs on the calling (worker) thread, so the callback must marshal any
+        UI work to the main thread itself.
+        """
+        if self.pm is None:
+            self._log("scan_aob: not attached.")
+            return []
+
+        pattern, mask = self._parse_aob(aob_pattern)
+        plen = len(pattern)
+        if plen == 0:
+            return []
+
+        # First fixed (non-wildcard) byte lets us fast-skip with bytes.find.
+        first_fixed = next((i for i, m in enumerate(mask) if m), 0)
+        first_byte = pattern[first_fixed]
+
+        # Resolving the module range walks the process module list; log around
+        # it so a stall *here* (before any read) is distinguishable in the log
+        # from a stall inside the read loop.
+        self._log("[{}] scan_aob: resolving main module range...".format(self._ts()))
+        base, size = self._main_module_range()
+        self._log("[{}] scan_aob: module range resolved base={:#x} size={} "
+                  "({:.1f} MB).".format(self._ts(), base, size, size / (1024 * 1024)))
+        if size == 0:
+            self._log("scan_aob: unknown module size, aborting scan.")
+            return []
+
+        CHUNK = 0x10000                 # 64 KB
+        overlap = plen - 1              # so boundary-straddling matches survive
+        PROGRESS_STEP = 0x100000        # report at most every ~1 MB
+        results = []
+        offset = 0
+        skipped = 0                     # chunks _read() could not read (None)
+        next_progress = 0
+        while offset < size:
+            read_len = min(CHUNK + overlap, size - offset)
+            chunk = self._read(base + offset, read_len)
+            if chunk:
+                pos = 0
+                while True:
+                    idx = chunk.find(first_byte, pos)
+                    if idx < 0 or idx + plen > len(chunk):
+                        break
+                    start = idx - first_fixed
+                    if start >= 0 and self._match_at(chunk, start, pattern, mask):
+                        addr = base + offset + start
+                        if addr not in results:
+                            results.append(addr)
+                    pos = idx + 1
+            else:
+                skipped += 1            # unreadable region — count, don't fail
+            # Throttled progress: only after crossing each ~1 MB boundary.
+            if progress_callback is not None and offset >= next_progress:
+                try:
+                    progress_callback(offset, size)
+                except Exception:
+                    pass                # a broken UI callback must not kill scan
+                next_progress = offset + PROGRESS_STEP
+            offset += CHUNK             # advance by CHUNK, not read_len (overlap)
+
+        # Final 100% tick so the bar completes even if the last step was <1 MB.
+        if progress_callback is not None:
+            try:
+                progress_callback(size, size)
+            except Exception:
+                pass
+
+        if skipped:
+            self._log("[{}] scan_aob: {} of {} chunk(s) unreadable and skipped "
+                      "(~{} bytes not scanned).".format(
+                          self._ts(), skipped, (size + CHUNK - 1) // CHUNK,
+                          skipped * CHUNK))
+        self._log("[{}] scan_aob: complete, {} match(es).".format(
+            self._ts(), len(results)))
+        return results
+
+    @staticmethod
+    def _match_at(buf, start, pattern, mask):
+        if start + len(pattern) > len(buf):
+            return False
+        for i, fixed in enumerate(mask):
+            if fixed and buf[start + i] != pattern[i]:
+                return False
+        return True
+
+    # ------------------------------------------------------------------
+    # Instruction encoders
+    # ------------------------------------------------------------------
+    def _enc_mov_slot_reg(self, reg_name, slot_addr, instr_addr):
+        """Encode 'mov [slot], reg'.
+
+        x86: absolute  ->  89 /r  mod=00 rm=101 disp32=slot           (6 bytes)
+        x64: rip-rel   ->  REX.W  89 /r  mod=00 rm=101 disp32=slot-rip (7 bytes)
+             (x64 has no direct mov [abs64], reg for general regs, so we make
+              the slot rip-relative; the slot lives in our own cave, well
+              within +/-2GB of the mov, so disp32 always fits.)
+        """
+        code = _REG_CODES.get(reg_name.lower())
+        if code is None:
+            raise ValueError("unsupported capture register: {}".format(reg_name))
+
+        if not self._is64:
+            if code > 7:
+                raise ValueError("r8-r15 not available in x86")
+            modrm = (code << 3) | 0x05
+            return bytes([0x89, modrm]) + struct.pack("<I", slot_addr & 0xFFFFFFFF)
+
+        rex = 0x48
+        if code > 7:
+            rex |= 0x04                 # REX.R for r8-r15
+        modrm = ((code & 7) << 3) | 0x05
+        instr_len = 7
+        disp = slot_addr - (instr_addr + instr_len)
+        return bytes([rex, 0x89, modrm]) + struct.pack("<i", disp)
+
+    @staticmethod
+    def _enc_jmp(src_addr, dst_addr, use_rel):
+        """Encode a jmp from src to dst.
+
+        use_rel True  -> E9 rel32                                   (5 bytes)
+        use_rel False -> FF 25 00000000 <abs8>  (jmp [rip+0])       (14 bytes)
+                         Register-safe absolute jump that reaches anywhere in
+                         the 64-bit address space (needed when the cave is
+                         allocated further than rel32 can reach).
+        """
+        if use_rel:
+            rel = dst_addr - (src_addr + 5)
+            # Explicit bounds check: a rel that overflows signed int32 must not
+            # reach struct.pack (which would raise an opaque struct.error). Fail
+            # with a specific, catchable exception carrying the diagnostics.
+            if not (-2147483648 <= rel <= 2147483647):
+                raise JmpOutOfRangeError(dst_addr, rel)
+            return bytes([0xE9]) + struct.pack("<i", rel)
+        return bytes([0xFF, 0x25, 0x00, 0x00, 0x00, 0x00]) + struct.pack("<Q", dst_addr)
+
+    # ------------------------------------------------------------------
+    # Cave allocation (with x64 near-allocation so rel32 can reach)
+    # ------------------------------------------------------------------
+    def _alloc_cave(self, near_addr):
+        """Allocate an RWX cave. Returns (address, use_rel).
+
+        x86: rel32 spans the whole 4GB space, so allocate anywhere.
+        x64: try to allocate within +/-2GB of `near_addr` so a 5-byte rel32
+             jmp reaches; if that fails, fall back to a far allocation and
+             signal use_rel=False so callers emit the 14-byte absolute jmp.
+        """
+        if not self._is64:
+            addr = self.pm.allocate(_CAVE_SIZE)
+            return int(addr), True
+
+        handle = self.pm.process_handle
+        # Search downward from just below the module (code caves are usually
+        # free there) in 64KB (allocation-granularity) steps, within 2GB.
+        step = 0x10000
+        limit = near_addr - 0x7F000000
+        hint = (near_addr - step) & ~(step - 1)
+        tries = 0
+        while hint > limit and hint > 0 and tries < 20000:
+            p = _kernel32.VirtualAllocEx(
+                handle, ctypes.c_void_p(hint), _CAVE_SIZE,
+                MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE,
+            )
+            if p:
+                # Defensive: VirtualAllocEx with a hint can, in principle, be
+                # satisfied at a different address. Confirm the result is really
+                # within rel32 reach before trusting use_rel=True; if not, free
+                # it and fall through to the absolute-jmp fallback rather than
+                # emitting a rel32 that cannot reach.
+                if abs(int(p) - near_addr) < 0x7FFFFFFF:
+                    self._log("x64 near-cave allocated at {:#x} (rel32 reachable).".format(p))
+                    return int(p), True
+                self._log(
+                    "x64 near-cave at {:#x} is {:#x} from hook {:#x} — outside "
+                    "rel32 range; freeing and falling back to absolute jmp.".format(
+                        int(p), abs(int(p) - near_addr), near_addr)
+                )
+                self._safe_free(int(p))
+                break
+            hint -= step
+            tries += 1
+
+        # Fallback: let the OS place it anywhere; use absolute jumps.
+        addr = self.pm.allocate(_CAVE_SIZE)
+        self._log(
+            "x64 near allocation failed; cave at {:#x} uses 14-byte absolute "
+            "jmp (requires steal_len >= 14).".format(addr)
+        )
+        return int(addr), False
+
+    # ------------------------------------------------------------------
+    # steal-length helper
+    # ------------------------------------------------------------------
+    def _steal_len(self, mod):
+        """The number of original bytes to relocate into the cave.
+
+        We treat mod['steal_len'] (preferred) or mod['hook_offset'] as an
+        already instruction-aligned length. GGMod does NOT bundle a length-
+        disassembler, so it cannot auto-extend a too-short hook_offset to the
+        next instruction boundary; callers must supply an aligned value.
+        """
+        return _parse_int(mod.get("steal_len", mod.get("hook_offset")))
+
+    def _min_jmp_len(self, use_rel=True):
+        return 5 if (not self._is64 or use_rel) else 14
+
+    @staticmethod
+    def _mod_hooks(mod):
+        """Return a mod's hook list.
+
+        New schema: mod['hooks'] is a list of {aob, hook_offset/steal_len,
+        capture_register}. For backward compatibility, a legacy flat mod
+        (top-level aob/hook_offset/capture_register) is wrapped as a 1-item
+        list so old configs still load.
+        """
+        if mod.get("hooks"):
+            return mod["hooks"]
+        if mod.get("aob"):
+            return [{
+                "aob": mod.get("aob"),
+                "hook_offset": mod.get("hook_offset"),
+                "steal_len": mod.get("steal_len"),
+                "capture_register": mod.get("capture_register"),
+            }]
+        return []
+
+    # ==================================================================
+    # PREVIEW  (gates Apply)
+    # ==================================================================
+    def preview_mod(self, mod, progress_callback=None):
+        """Return match count + status + byte previews without writing.
+
+        hard_freeze: single AOB -> single result.
+        pointer_capture: one entry per hook under result['hooks']; overall
+        status is 'ready' only if EVERY hook is ready.
+        """
+        result = {
+            "matches": 0,
+            "status": "blocked_no_match",
+            "original_bytes": None,
+            "cave_preview": None,
+            "hooks": None,
+            "warnings": [],
+        }
+        if self.pm is None:
+            result["status"] = "blocked_not_attached"
+            self._log("preview: not attached.")
+            return result
+
+        template = mod.get("template")
+
+        if template == "hard_freeze":
+            matches = self.scan_aob(mod.get("aob", ""),
+                                    progress_callback=progress_callback)
+            result["matches"] = len(matches)
+            result["match_addresses"] = ["0x{:X}".format(a) for a in matches[:20]]
+            if len(matches) == 0:
+                result["status"] = "blocked_no_match"
+            elif len(matches) > 1:
+                result["status"] = "blocked_multiple_match"
+            else:
+                length = self._freeze_len(mod)
+                target = matches[0] + _parse_int(mod.get("offset"))
+                result["original_bytes"] = (self._read(target, length) or b"").hex(" ")
+                result["status"] = "ready"
+
+        elif template == "pointer_capture":
+            self._preview_pointer_capture(mod, result,
+                                          progress_callback=progress_callback)
+
+        else:
+            result["status"] = "blocked_unknown_template"
+            result["warnings"].append("unknown template: {}".format(template))
+
+        self._log(
+            "preview '{}': matches={} status={} {}".format(
+                mod.get("name"), result["matches"], result["status"],
+                ("warn: " + "; ".join(result["warnings"])) if result["warnings"] else "",
+            )
+        )
+        return result
+
+    def _preview_pointer_capture(self, mod, result, progress_callback=None):
+        """Fill result with per-hook match/byte info for a pointer_capture mod."""
+        hooks = self._mod_hooks(mod)
+        if not hooks:
+            result["status"] = "blocked_no_match"
+            result["warnings"].append("no hooks defined")
+            result["hooks"] = []
+            return
+
+        hook_results = []
+        overall_ready = True
+        total_matches = 0
+        for i, hook in enumerate(hooks):
+            aob = hook.get("aob", "")
+            steal_len = _parse_int(hook.get("steal_len", hook.get("hook_offset")))
+            reg = hook.get("capture_register", "eax")
+            matches = self.scan_aob(aob, progress_callback=progress_callback)
+            total_matches += len(matches)
+            hr = {
+                "index": i, "aob": aob, "capture_register": reg,
+                "steal_len": steal_len, "matches": len(matches),
+                "match_addresses": ["0x{:X}".format(a) for a in matches[:20]],
+                "status": "ready", "original_bytes": None,
+                "cave_preview": None, "warnings": [],
+            }
+            if len(matches) == 0:
+                hr["status"] = "blocked_no_match"
+                overall_ready = False
+            elif len(matches) > 1:
+                hr["status"] = "blocked_multiple_match"
+                overall_ready = False
+            else:
+                addr = matches[0]
+                steal_bytes = self._read(addr, steal_len) or b""
+                hr["original_bytes"] = steal_bytes.hex(" ")
+                min_len = self._min_jmp_len(use_rel=True)  # optimistic (near-alloc)
+                if steal_len < min_len:
+                    hr["status"] = "blocked_steal_len"
+                    hr["warnings"].append(
+                        "steal_len {} < {} (min for jmp).".format(steal_len, min_len)
+                    )
+                    overall_ready = False
+                if self._is64 and steal_len < 14:
+                    hr["warnings"].append(
+                        "x64: if near-allocation fails a 14-byte absolute jmp is "
+                        "needed but steal_len is {}.".format(steal_len)
+                    )
+                # Placeholder (zero) addresses; stolen bytes are real. With
+                # code_start=0 and a real hook_addr, the return jmp's rel32 is
+                # deliberately unrealistic (the true cave address isn't known
+                # until apply), so it can exceed rel32 range — that's expected
+                # for the preview and must not abort the scan. Show a note.
+                try:
+                    hr["cave_preview"] = self._build_cave_code(
+                        steal_bytes, reg, slot_addr=0, code_start=0,
+                        hook_addr=addr, steal_len=steal_len, use_rel=True,
+                    ).hex(" ")
+                except JmpOutOfRangeError:
+                    hr["cave_preview"] = (
+                        "(preview n/a: placeholder jmp exceeds rel32 range; "
+                        "actual cave is allocated near the hook at apply time)"
+                    )
+            hook_results.append(hr)
+
+        result["hooks"] = hook_results
+        result["matches"] = total_matches
+        result["status"] = "ready" if overall_ready else "blocked_hooks"
+
+    # ==================================================================
+    # APPLY  (dispatch + gate)
+    # ==================================================================
+    def apply_mod(self, mod):
+        """Apply a mod, refusing unless preview status is 'ready'."""
+        preview = self.preview_mod(mod)
+        if preview["status"] != "ready":
+            self._log(
+                "Refusing to apply '{}': status is '{}'.".format(
+                    mod.get("name"), preview["status"]
+                )
+            )
+            return False
+
+        template = mod.get("template")
+        if template == "hard_freeze":
+            return self.apply_hard_freeze(mod)
+        if template == "pointer_capture":
+            return self.apply_pointer_capture(mod)
+        self._log("Unknown template for '{}'.".format(mod.get("name")))
+        return False
+
+    # ==================================================================
+    # TEMPLATE: hard_freeze
+    # ==================================================================
+    def _freeze_len(self, mod):
+        """Bytes written per tick: nop_len for 'nop' mode, else 4 (int32)."""
+        if mod.get("freeze_mode") == "nop":
+            return _parse_int(mod.get("nop_len", 0))
+        return 4
+
+    def apply_hard_freeze(self, mod):
+        """Continuously overwrite a target address (50ms poll).
+
+        Two modes:
+          - default ("value"): write mod['value'] as int32 to match+offset.
+            Use when the target is a DATA address the game keeps rewriting.
+          - "nop": write nop_len 0x90 bytes over match+offset. Use when the
+            target is a CODE instruction that must be neutralised (e.g. a
+            'dec [reg+x]' counter decrement). Original bytes are restored on
+            stop/detach.
+        """
+        name = mod.get("name")
+        matches = self.scan_aob(mod.get("aob", ""))
+        if len(matches) != 1:
+            self._log(
+                "hard_freeze '{}': need exactly 1 match, got {}. Aborting.".format(
+                    name, len(matches)
+                )
+            )
+            return False
+
+        target = matches[0] + _parse_int(mod.get("offset"))
+        nop_mode = mod.get("freeze_mode") == "nop"
+        length = self._freeze_len(mod)
+
+        original = self._read(target, length) or b""
+        patches = []
+        if nop_mode:
+            if length <= 0:
+                self._log("hard_freeze '{}': nop mode needs nop_len > 0.".format(name))
+                return False
+            # Code write: make the page writable and remember bytes to restore.
+            self._make_rwx(target, length)
+            patches.append((target, original))
+            payload = b"\x90" * length
+        else:
+            payload = struct.pack("<i", _parse_int(mod.get("value")))
+
+        stop = threading.Event()
+
+        def _loop():
+            while not stop.is_set():
+                try:
+                    self._write(target, payload)
+                except Exception:
+                    pass  # transient failures (paused/loading) are non-fatal
+                time.sleep(0.05)
+
+        thread = threading.Thread(target=_loop, daemon=True)
+        self._active[name] = {
+            "stop": stop, "thread": thread, "patches": patches,
+            "cave": None, "kind": "hard_freeze",
+        }
+        thread.start()
+        self._log(
+            "hard_freeze '{}' active at {:#x} ({} mode).".format(
+                name, target, "nop" if nop_mode else "value"
+            )
+        )
+        return True
+
+    # ==================================================================
+    # TEMPLATE: pointer_capture
+    # ==================================================================
+    def _build_cave_code(self, steal_bytes, reg_name, slot_addr, code_start,
+                         hook_addr, steal_len, use_rel):
+        """Assemble the cave body: stolen bytes, capture store, jmp back."""
+        code = bytearray()
+        code += steal_bytes                                   # relocated originals
+        mov_addr = code_start + len(code)
+        code += self._enc_mov_slot_reg(reg_name, slot_addr, mov_addr)  # capture
+        jmp_addr = code_start + len(code)
+        code += self._enc_jmp(jmp_addr, hook_addr + steal_len, use_rel)  # return
+        return bytes(code)
+
+    def _install_hook(self, name, hook, slot_addr):
+        """Build one hook's cave (writing to the SHARED slot_addr) and patch
+        its site. Returns (cave_addr, (hook_addr, original_bytes)) on success,
+        or None on failure. Reuses the proven single-hook cave-building path
+        (_alloc_cave / _build_cave_code / _enc_jmp) unchanged.
+        """
+        hook_addr = self.scan_aob(hook.get("aob", ""))[0]  # caller pre-validated
+        reg_name = hook.get("capture_register", "eax")
+        steal_len = _parse_int(hook.get("steal_len", hook.get("hook_offset")))
+
+        cave, use_rel = self._alloc_cave(hook_addr)
+        min_len = self._min_jmp_len(use_rel)
+        if steal_len < min_len:
+            self._log(
+                "pointer_capture '{}': hook @{:#x} steal_len {} < required {} "
+                "for this jmp mode. Aborting.".format(name, hook_addr, steal_len, min_len)
+            )
+            self._safe_free(cave)
+            return None
+
+        code_start = cave + _CODE_OFF
+        steal_bytes = self._read(hook_addr, steal_len)
+        if not steal_bytes:
+            self._log("pointer_capture '{}': could not read hook @{:#x}.".format(name, hook_addr))
+            self._safe_free(cave)
+            return None
+
+        # Encode both jmps under a guard: the return jmp (inside
+        # _build_cave_code) and the outbound jmp below both use rel32 on the
+        # near-alloc path, so a miscalculated cave distance surfaces here as
+        # JmpOutOfRangeError. Treat it exactly like the steal_len abort: free
+        # the cave and return None (the caller rolls back cleanly). Both encodes
+        # happen BEFORE any write to the hook site, so no partial patch leaks.
+        try:
+            # Every hook's cave writes the captured pointer to the SAME slot_addr.
+            cave_code = self._build_cave_code(
+                steal_bytes, reg_name, slot_addr, code_start, hook_addr,
+                steal_len, use_rel,
+            )
+            jmp_bytes = self._enc_jmp(hook_addr, code_start, use_rel)
+        except JmpOutOfRangeError as exc:
+            self._log(
+                "Hook '{}': jmp target out of range (rel={}), aborting — cave "
+                "allocation may have miscalculated proximity.".format(name, exc.rel)
+            )
+            self._safe_free(cave)
+            return None
+
+        self._write(code_start, cave_code)
+
+        # Patch the hook site: jmp to cave + NOP-fill the remainder.
+        self._make_rwx(hook_addr, steal_len)
+        patch = bytearray(jmp_bytes) + b"\x90" * (steal_len - len(jmp_bytes))
+        self._write(hook_addr, patch)
+
+        self._log(
+            "  hook @{:#x} -> cave {:#x} (reg {}, steal {}, {}).".format(
+                hook_addr, cave, reg_name, steal_len,
+                "rel32" if use_rel else "abs-jmp",
+            )
+        )
+        return cave, (hook_addr, bytes(steal_bytes))
+
+    def apply_pointer_capture(self, mod):
+        """Hook one OR MORE instructions, all capturing a base pointer into a
+        single shared slot, and poll-write [pointer + struct_offset].
+
+        Multiple hooks (e.g. a heal path and a damage path) feed the SAME
+        slot: whichever path the game executes refreshes the one pointer the
+        poll thread reads.
+        """
+        name = mod.get("name")
+        hooks = self._mod_hooks(mod)
+        if not hooks:
+            self._log("pointer_capture '{}': no hooks defined. Aborting.".format(name))
+            return False
+
+        # --- Pre-validate ALL hooks before writing anything. A mod with only
+        #     some hooks working behaves inconsistently, so it's all-or-nothing.
+        for i, hook in enumerate(hooks):
+            n = len(self.scan_aob(hook.get("aob", "")))
+            if n != 1:
+                self._log(
+                    "pointer_capture '{}': hook #{} AOB has {} matches (need "
+                    "exactly 1). Aborting whole mod.".format(name, i, n)
+                )
+                return False
+
+        ptr_size = 8 if self._is64 else 4
+        struct_offset = _parse_int(mod.get("struct_offset"))
+        poll_mode = mod.get("poll_mode", "never_decrease")
+
+        # --- ONE shared slot for the whole mod. Its own allocation (near hook
+        #     #0 on x64 so rip-relative movs from every hook's cave can reach).
+        #     VirtualAllocEx is page-aligned, so slot_addr is pointer-aligned
+        #     and pointer-sized stores from concurrent hooks are atomic (no
+        #     torn pointer); only the first ptr_size bytes are used.
+        slot_region, _ = self._alloc_cave(self.scan_aob(hooks[0].get("aob", ""))[0])
+        slot_addr = slot_region + _SLOT_OFF
+        self._write(slot_addr, b"\x00" * ptr_size)
+
+        caves = [slot_region]     # free all of these on teardown
+        patches = []              # (addr, original_bytes) per hook, to restore
+        for hook in hooks:
+            installed = self._install_hook(name, hook, slot_addr)
+            if installed is None:
+                # Roll back everything already written/allocated: restore any
+                # patched bytes and free every cave (including the slot region).
+                for addr, original in patches:
+                    try:
+                        self._make_rwx(addr, len(original))
+                        self._write(addr, original)
+                    except Exception:
+                        pass
+                for c in caves:
+                    self._safe_free(c)
+                return False
+            cave, patch_entry = installed
+            caves.append(cave)
+            patches.append(patch_entry)
+
+        # (e) Best-effort attach-time capture — see single-hook note: the slot
+        # only holds a real pointer AFTER a hooked instruction runs in-game.
+        if mod.get("capture_at_attach"):
+            raw = self._read(slot_addr, ptr_size) or b""
+            initial = int.from_bytes(raw, "little") if raw else 0
+            self._log(
+                "pointer_capture '{}': attach-time capture (best-effort) = "
+                "{:#x}. If 0, no hooked path has executed yet.".format(name, initial)
+            )
+
+        stop = threading.Event()
+        # "max": never_decrease tracking. "last_slot": last-seen slot value, so
+        # we can log only when the captured pointer CHANGES (not every tick).
+        # Init to 0 since the slot was just zeroed at apply.
+        # "value": the live value the poll thread writes (hard_set) or clamps to
+        # (clamp_min). set_mod_value() reassigns this key at runtime; a single
+        # dict-key assignment is atomic under the GIL, so no lock is needed.
+        state = {"max": None, "last_slot": 0, "value": _parse_int(mod.get("value"))}
+
+        def _loop():
+            while not stop.is_set():
+                try:
+                    raw = self._read(slot_addr, ptr_size)
+                    ptr = int.from_bytes(raw, "little") if raw else 0
+                    if ptr != state["last_slot"]:
+                        self._log(
+                            "slot updated: 0x{:x} -> 0x{:x} (mod '{}')".format(
+                                state["last_slot"], ptr, name
+                            )
+                        )
+                        state["last_slot"] = ptr
+                    if ptr:
+                        target = ptr + struct_offset
+                        if poll_mode == "hard_set":
+                            # Unconditional overwrite every tick — no read/compare.
+                            # Matches the original trainer's continuous-write
+                            # freeze: agnostic to how many code paths drain the
+                            # value, we just keep slamming it back.
+                            self._write(target, struct.pack("<i", state["value"]))
+                        else:
+                            cur = struct.unpack("<i", self._read(target, 4))[0]
+                            if poll_mode == "never_decrease":
+                                if state["max"] is None or cur > state["max"]:
+                                    state["max"] = cur
+                                elif cur < state["max"]:
+                                    self._write(target, struct.pack("<i", state["max"]))
+                            elif poll_mode == "clamp_min":
+                                floor = state["value"]  # snapshot once per tick
+                                if cur < floor:
+                                    self._write(target, struct.pack("<i", floor))
+                            # "set_once" handled by set_once_trigger(), not here.
+                except Exception:
+                    pass
+                time.sleep(0.05)
+
+        thread = threading.Thread(target=_loop, daemon=True)
+        self._active[name] = {
+            "stop": stop, "thread": thread,
+            "patches": patches,            # ALL hooks' original bytes
+            "cave": None, "caves": caves,  # slot region + every hook cave
+            "kind": "pointer_capture",
+            "slot": slot_addr, "struct_offset": struct_offset,
+            "poll_mode": poll_mode, "ptr_size": ptr_size,
+            "state": state,                # live poll state (settable value)
+        }
+        if poll_mode != "set_once":
+            thread.start()
+        self._log(
+            "pointer_capture '{}' active: {} hook(s), shared slot {:#x}, "
+            "mode {}.".format(name, len(hooks), slot_addr, poll_mode)
+        )
+        return True
+
+    def set_once_trigger(self, mod_name):
+        """For poll_mode 'set_once': write mod['value'] once, now."""
+        entry = self._active.get(mod_name)
+        if not entry or entry.get("poll_mode") != "set_once":
+            self._log("set_once_trigger: '{}' not a set_once mod.".format(mod_name))
+            return
+        mod = next((m for m in self.mods if m.get("name") == mod_name), None)
+        if mod is None:
+            return
+        raw = self._read(entry["slot"], entry["ptr_size"])
+        ptr = int.from_bytes(raw, "little") if raw else 0
+        if not ptr:
+            self._log("set_once '{}': no pointer captured yet.".format(mod_name))
+            return
+        target = ptr + entry["struct_offset"]
+        self._write(target, struct.pack("<i", _parse_int(mod.get("value"))))
+        self._log("set_once '{}': wrote value at {:#x}.".format(mod_name, target))
+
+    def set_mod_value(self, name, new_value):
+        """Live-update the value an active hard_set / clamp_min mod writes.
+
+        Updates the poll thread's in-memory value (atomic dict assignment, no
+        disable/reapply needed) and also mod['value'] in the loaded config so
+        it persists across a disable/reapply within this session. Does NOT
+        write back to the JSON file.
+        """
+        entry = self._active.get(name)
+        if entry is None:
+            self._log("set_mod_value: '{}' is not active.".format(name))
+            return False
+        if entry.get("poll_mode") not in ("hard_set", "clamp_min"):
+            self._log(
+                "set_mod_value: '{}' poll_mode '{}' has no settable value.".format(
+                    name, entry.get("poll_mode")
+                )
+            )
+            return False
+        try:
+            new_value = int(new_value)
+        except (TypeError, ValueError):
+            self._log("set_mod_value: '{}' is not a valid integer.".format(new_value))
+            return False
+
+        state = entry.get("state")
+        old = state.get("value") if state else None
+        if state is not None:
+            state["value"] = new_value       # atomic; poll thread reads next tick
+        mod = next((m for m in self.mods if m.get("name") == name), None)
+        if mod is not None:
+            mod["value"] = new_value          # session persistence, not JSON
+        self._log("Value updated: '{}' {} -> {}".format(name, old, new_value))
+        return True
+
+    def force_set_value(self, mod_name, value):
+        """One-time write of `value` to [captured_pointer + struct_offset] for
+        ANY active pointer_capture mod, regardless of poll_mode.
+
+        This does NOT alter ongoing poll behaviour (a never_decrease mod stays
+        never_decrease; it simply receives one immediate write on top). Rejects
+        cleanly if the mod isn't active or no pointer has been captured yet.
+        """
+        entry = self._active.get(mod_name)
+        if entry is None:
+            self._log("force_set: '{}' is not active.".format(mod_name))
+            return False
+        if entry.get("kind") != "pointer_capture":
+            self._log("force_set: '{}' is not a pointer_capture mod.".format(mod_name))
+            return False
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            self._log("force_set: '{}' is not a valid integer.".format(value))
+            return False
+
+        raw = self._read(entry["slot"], entry["ptr_size"])
+        ptr = int.from_bytes(raw, "little") if raw else 0
+        if not ptr:
+            self._log(
+                "force_set: '{}' has no pointer captured yet (slot is 0x0); "
+                "trigger the hooked code path in-game first.".format(mod_name)
+            )
+            return False
+
+        target = ptr + entry["struct_offset"]
+        try:
+            self._write(target, struct.pack("<i", value))
+        except Exception as exc:
+            self._log("force_set: '{}' write failed: {}".format(mod_name, exc))
+            return False
+        self._log("Force-set '{}' -> {} (one-time write)".format(mod_name, value))
+        return True
+
+    # ==================================================================
+    # TOGGLE / TEARDOWN
+    # ==================================================================
+    def toggle_mod(self, mod_name, enabled):
+        """Enable or disable a loaded mod by name."""
+        mod = next((m for m in self.mods if m.get("name") == mod_name), None)
+        if mod is None:
+            self._log("toggle_mod: no mod named '{}'.".format(mod_name))
+            return
+
+        if enabled:
+            if mod_name in self._active:
+                self._log("toggle_mod: '{}' already active.".format(mod_name))
+                return
+            self.apply_mod(mod)
+        else:
+            self._teardown_mod(mod_name)
+
+    def _teardown_mod(self, name):
+        """Stop a mod's thread and restore any code it patched."""
+        entry = self._active.pop(name, None)
+        if entry is None:
+            return
+        entry["stop"].set()
+        thread = entry.get("thread")
+        if thread and thread.is_alive():
+            thread.join(timeout=0.5)
+        for address, original in entry.get("patches", []):
+            try:
+                self._make_rwx(address, len(original))
+                self._write(address, original)
+            except Exception as exc:
+                self._log("Failed to restore bytes at {:#x}: {}".format(address, exc))
+        # Free every cave for this mod (single legacy 'cave' + the 'caves' list
+        # used by multi-hook pointer_capture — slot region and per-hook caves).
+        self._safe_free(entry.get("cave"))
+        for cave in entry.get("caves", []):
+            self._safe_free(cave)
+        self._log("Disabled '{}' (bytes restored, {} cave(s) freed).".format(
+            name, len(entry.get("caves", [])) + (1 if entry.get("cave") else 0)))
+
+    def _safe_free(self, cave):
+        if not cave:
+            return
+        try:
+            self.pm.free(cave)
+        except Exception as exc:
+            self._log("Failed to free cave {:#x}: {}".format(cave, exc))
+
+    # ==================================================================
+    # Read-only status helpers (thin wrappers for the UI; no side effects)
+    # ==================================================================
+    def is_attached(self):
+        """True if currently attached to a process."""
+        return self.pm is not None
+
+    def is_mod_active(self, mod_name):
+        """True if the named mod currently has a live patch/poll thread."""
+        return mod_name in self._active

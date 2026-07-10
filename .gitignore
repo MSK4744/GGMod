@@ -1,0 +1,5 @@
+﻿dist/
+games/
+build/
+__pycache__/
+*.spec
