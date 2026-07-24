@@ -20,8 +20,21 @@ class HotkeyManager:
         # log_callback(message: str) lets the UI receive our messages
         # without this module knowing anything about tkinter.
         self._log = log_callback if log_callback else (lambda msg: None)
-        # key_name -> keyboard hook handle, so we can unregister.
+        # canonical key_name (e.g. "num 1", "f2", "ctrl+num 1") -> callback.
+        # NOTE: we do NOT use keyboard.add_hotkey for matching. add_hotkey maps
+        # a name to a SET of scan codes that lumps numpad 1 (sc 79) together
+        # with top-row 1 (sc 2), so a "num 1" binding would also fire on the
+        # top row (and on OS key-repeat). Instead we run ONE low-level hook and
+        # match each event's exact canonical name ourselves (see _on_event).
         self._registered = {}
+        self._hook_handle = None       # keyboard.hook handle (installed lazily)
+        # Scan codes currently physically held down. Used for down-after-up
+        # debounce so OS key-repeat (KEY_DOWN with no intervening KEY_UP) does
+        # not fire a hotkey more than once per real press.
+        self._pressed = set()
+        # Per-keydown diagnostic logging (scan code + canonical name + match
+        # result). Matches are always logged; set False to silence non-matches.
+        self.debug = True
 
     def _clean_name(self, event):
         """Build our canonical key name from a keyboard event.
@@ -92,33 +105,87 @@ class HotkeyManager:
             )
             return combo
 
+    def _event_combo(self, event):
+        """Canonical hotkey string for a KEY_DOWN event, matching exactly the
+        format capture_next_key() saved: numpad keys become 'num 1' (via
+        is_keypad), top-row stays '1', and held modifiers prefix in canonical
+        order ('ctrl+num 1'). This is what restores the numpad/top-row split at
+        MATCH time that keyboard.add_hotkey collapses."""
+        name = self._clean_name(event)
+        mods = self._active_modifiers()
+        return "+".join(mods + [name]) if mods else name
+
+    def _on_event(self, event):
+        """Single global hook: exact-name match + repeat debounce."""
+        try:
+            if event.event_type == keyboard.KEY_UP:
+                self._pressed.discard(event.scan_code)
+                return
+            if event.event_type != keyboard.KEY_DOWN:
+                return
+
+            # Debounce: OS key-repeat resends KEY_DOWN with the same scan code
+            # and NO KEY_UP in between. Only the first down (after an up) counts.
+            is_repeat = event.scan_code in self._pressed
+            self._pressed.add(event.scan_code)
+            if is_repeat:
+                return
+
+            # Bare modifier presses never trigger; they gate combos via
+            # _active_modifiers (keyboard.is_pressed) on the main key's event.
+            if self._is_modifier(event):
+                return
+            if not self._registered:
+                return
+
+            combo = self._event_combo(event)
+            callback = self._registered.get(combo)
+            matched = callback is not None
+            if matched or self.debug:
+                self._log(
+                    "keydown sc={} keypad={} -> '{}' [{}]".format(
+                        event.scan_code, getattr(event, "is_keypad", False),
+                        combo, "MATCH -> trigger" if matched else "no match"
+                    )
+                )
+            if matched:
+                try:
+                    callback()
+                except Exception as exc:
+                    self._log("hotkey '{}' callback error: {}".format(combo, exc))
+        except Exception as exc:            # a hook must never raise
+            self._log("hotkey hook error: {}".format(exc))
+
+    def _ensure_hook(self):
+        if self._hook_handle is None:
+            self._hook_handle = keyboard.hook(self._on_event)
+
     def register(self, key_name: str, callback):
-        """Register a global hotkey for the exact key_name.
+        """Register a global hotkey for the EXACT canonical key_name.
 
-        Re-registering the same key_name rebinds it to the new callback.
+        Matching is by exact canonical name (numpad-aware) on a single shared
+        low-level hook, not keyboard.add_hotkey. Re-registering the same name
+        rebinds it to the new callback.
         """
-        # Rebind support: drop any existing hook for this key first.
-        if key_name in self._registered:
-            self.unregister(key_name)
-
-        handle = keyboard.add_hotkey(key_name, callback, suppress=False)
-        self._registered[key_name] = handle
+        self._registered[key_name] = callback
+        self._ensure_hook()
         self._log("Registered hotkey: '{}'".format(key_name))
 
     def unregister(self, key_name: str):
-        """Remove the global hotkey bound to key_name, if any."""
-        handle = self._registered.pop(key_name, None)
-        if handle is None:
+        """Remove the hotkey bound to key_name, if any."""
+        if self._registered.pop(key_name, None) is None:
             self._log("No hotkey to unregister for: '{}'".format(key_name))
             return
-        try:
-            keyboard.remove_hotkey(handle)
-            self._log("Unregistered hotkey: '{}'".format(key_name))
-        except (KeyError, ValueError) as exc:
-            self._log("Failed to unregister '{}': {}".format(key_name, exc))
+        self._log("Unregistered hotkey: '{}'".format(key_name))
 
     def unregister_all(self):
-        """Remove every hotkey this manager registered."""
-        for key_name in list(self._registered.keys()):
-            self.unregister(key_name)
+        """Remove every hotkey and tear down the shared hook."""
+        self._registered.clear()
+        self._pressed.clear()
+        if self._hook_handle is not None:
+            try:
+                keyboard.unhook(self._hook_handle)
+            except (KeyError, ValueError) as exc:
+                self._log("Failed to remove keyboard hook: {}".format(exc))
+            self._hook_handle = None
         self._log("All hotkeys unregistered.")
