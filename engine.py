@@ -15,6 +15,7 @@ comments and surfaced via the log callback.
 
 import ctypes
 import json
+import re
 import struct
 import threading
 import time
@@ -137,6 +138,89 @@ def _parse_offset(value, default=0):
     if not s:
         return default
     return int(s, 16)  # accepts an optional "0x" prefix too
+
+
+# A single Intel-style memory operand: [base +/- disp], e.g. "[ebx+18]",
+# "[rsi+0x1F4]", "[rax-10]". Bytes/addresses in a pasted line have no brackets,
+# so scanning the whole line for brackets is safe.
+_MEM_OPERAND_RE = re.compile(r"\[([^\]]+)\]")
+_BASE_DISP_RE = re.compile(
+    r"^(?P<base>[a-z][a-z0-9]*)(?P<disp>[+-](?:0x)?[0-9a-f]+)?$", re.IGNORECASE)
+
+
+def parse_disasm_line(line):
+    """Parse a pasted disassembly line into capture_register + struct_offset.
+
+    Pure text — no live process needed. Tolerates Cheat-Engine 'find what
+    writes' formats with or without a leading address/bytes, e.g.:
+        "0053FBBA - 89 7B 18 - mov [ebx+18],edi"
+        "mov [ebx+18],edi"
+        "dec [rax+20]"
+        "mov [rsi+0x1F4],rbx"
+    Extracts a SINGLE memory operand's base register and hex displacement,
+    returning struct_offset as a hex string (no 0x prefix, negatives as "-10")
+    so it round-trips through _parse_offset exactly like a hand-typed value.
+
+    Returns a dict: mnemonic, capture_register, struct_offset, memory_operand,
+    reason. On anything ambiguous, capture_register/struct_offset stay None and
+    reason explains why (rather than guessing).
+    """
+    result = {"mnemonic": None, "capture_register": None, "struct_offset": None,
+              "memory_operand": None, "reason": "ok"}
+    if not line or not line.strip():
+        result["reason"] = "empty line"
+        return result
+    text = line.strip()
+
+    # Mnemonic (informational): first alphabetic token of the segment that has
+    # the operand (CE uses 'addr - bytes - mnemonic operands').
+    segments = [s.strip() for s in text.split(" - ")]
+    instr = next((s for s in segments if "[" in s), segments[-1])
+    mtok = re.match(r"\s*([a-zA-Z]+)", instr)
+    if mtok:
+        result["mnemonic"] = mtok.group(1).lower()
+
+    mem_ops = _MEM_OPERAND_RE.findall(text)
+    if not mem_ops:
+        result["reason"] = "no memory operand — nothing to fill"
+        return result
+    uniq = list(dict.fromkeys(m.strip() for m in mem_ops))
+    if len(uniq) > 1:
+        result["reason"] = "multiple memory operands — set register/offset manually"
+        return result
+
+    inner = uniq[0]
+    result["memory_operand"] = "[{}]".format(inner)
+    norm = inner.replace(" ", "").lower()
+    if "*" in norm:
+        result["reason"] = "scaled-index addressing not supported — set manually"
+        return result
+    m = _BASE_DISP_RE.match(norm)
+    if not m:
+        result["reason"] = "complex operand (index/absolute) — set manually"
+        return result
+    base = m.group("base")
+    if base not in _REG_CODES:
+        result["reason"] = "unsupported base register '{}'".format(base)
+        return result
+    disp = m.group("disp")
+    if not disp:
+        result["reason"] = "memory operand has no displacement (register-only)"
+        return result
+
+    sign = -1 if disp[0] == "-" else 1
+    hexpart = disp[1:]
+    if hexpart.lower().startswith("0x"):
+        hexpart = hexpart[2:]
+    try:
+        val = int(hexpart, 16) * sign
+    except ValueError:
+        result["reason"] = "could not parse displacement '{}'".format(disp)
+        return result
+
+    result["capture_register"] = base
+    result["struct_offset"] = "-{:X}".format(-val) if val < 0 else "{:X}".format(val)
+    return result
 
 
 class TrainerEngine:
@@ -744,6 +828,76 @@ class TrainerEngine:
             "reason": reason,
             "instructions": instructions,
         }
+
+    def suggest_jmp_type(self, hook_address=None, module_name=None):
+        """Advisory heuristic: is a rel32 near-cave likely reachable, or should
+        the user pre-commit to a 14-byte absolute-jmp steal?
+
+        ADVICE ONLY. The real decision happens at apply time in _alloc_cave,
+        which searches for a near rel32 cave and automatically falls back to an
+        absolute jmp when none is found — that remains the source of truth. This
+        just helps the user pick a steal length up front that won't need redoing
+        (rel32 -> 5-byte min, absolute -> 14-byte min).
+
+        Resolves the target module by containing address (if given) or by name.
+        Returns {jmp_type, reason, module, module_size, is64}.
+        """
+        MB = 1024 * 1024
+        module_label = module_name or "main module"
+
+        # 32-bit: an E9 rel32 reaches the whole 4 GB space — always rel32.
+        if not self._is64:
+            return {"jmp_type": "rel32", "module": module_label,
+                    "module_size": 0, "is64": False,
+                    "reason": "32-bit process — rel32 reaches the entire "
+                              "address space."}
+
+        if self.pm is None:
+            return {"jmp_type": "rel32", "module": module_label,
+                    "module_size": 0, "is64": True,
+                    "reason": "Not attached — assuming rel32 (apply-time "
+                              "absolute fallback still applies)."}
+
+        # Resolve the module range: by containing module for a live address,
+        # else by module name (None = main executable module).
+        size = 0
+        if hook_address is not None:
+            try:
+                name, _base, size = self._module_for_address(int(hook_address))
+                module_label = name or "main module"
+            except (TypeError, ValueError):
+                size = 0
+        else:
+            _base, size = self._main_module_range(module_name)
+
+        if not size:
+            return {"jmp_type": "rel32", "module": module_label,
+                    "module_size": 0, "is64": True,
+                    "reason": "Module size unknown — assuming rel32 (apply-time "
+                              "absolute fallback still applies)."}
+
+        mb = size / MB
+        # rel32 reaches +/-2GB; _alloc_cave searches downward from the hook for a
+        # free near page. Small/medium modules almost always yield one. Only for
+        # unusually large modules is a near allocation notably less certain, so
+        # we advise the safe 14-byte absolute steal there.
+        if size >= 256 * MB:
+            return {"jmp_type": "absolute", "module": module_label,
+                    "module_size": size, "is64": True,
+                    "reason": "Module is {:.0f} MB (unusually large): a near "
+                              "rel32 cave may not be found. Absolute (14-byte "
+                              "steal) avoids an apply-time abort; automatic "
+                              "fallback still applies.".format(mb)}
+        if size >= 64 * MB:
+            return {"jmp_type": "rel32", "module": module_label,
+                    "module_size": size, "is64": True,
+                    "reason": "Module is {:.0f} MB: a near rel32 cave should "
+                              "still be reachable (automatic absolute fallback "
+                              "applies if not).".format(mb)}
+        return {"jmp_type": "rel32", "module": module_label,
+                "module_size": size, "is64": True,
+                "reason": "Module is {:.1f} MB: near rel32 cave easily "
+                          "reachable.".format(mb)}
 
     @staticmethod
     def _mod_hooks(mod):

@@ -529,6 +529,10 @@ class GGModUI:
             "hook_offset": tk.StringVar(value=str(prefill.get("hook_offset", ""))),
             "register": tk.StringVar(value=prefill.get("capture_register", "esi")),
             "module": tk.StringVar(value=prefill.get("module", "") or ""),
+            # jmp type used for the Auto steal computation (rel32 -> 5-byte min,
+            # absolute -> 14-byte min). Advisory only; not stored in JSON.
+            "jmp_type": tk.StringVar(value="rel32"),
+            "suggest": tk.StringVar(value=""),   # inline suggestion note
         }
 
         line1 = tk.Frame(row, bg=BG2)
@@ -546,6 +550,13 @@ class GGModUI:
             bg=ACCENT2, fg=WHITE, activebackground=ACCENT, activeforeground=WHITE,
             relief=tk.FLAT, cursor="hand2", font=(FONT, 8, "bold"), padx=6,
         ).pack(side=tk.LEFT, padx=(6, 0))
+        # Offline: paste a disassembly line to fill register/offset (no attach).
+        tk.Button(
+            line1, text="Paste line…",
+            command=lambda: self._paste_line(entry),
+            bg=ACCENT2, fg=WHITE, activebackground=ACCENT, activeforeground=WHITE,
+            relief=tk.FLAT, cursor="hand2", font=(FONT, 8, "bold"), padx=6,
+        ).pack(side=tk.LEFT, padx=(4, 0))
 
         line2 = tk.Frame(row, bg=BG2)
         line2.pack(fill=tk.X, padx=4, pady=(0, 3))
@@ -579,6 +590,18 @@ class GGModUI:
             bg=BG2, fg=RED, activebackground=RED, activeforeground=BG,
             relief=tk.FLAT, cursor="hand2", font=(FONT, 9, "bold"),
         ).pack(side=tk.RIGHT)
+
+        # ---- line3: jmp type (for Auto steal) + advisory suggestion note ----
+        line3 = tk.Frame(row, bg=BG2)
+        line3.pack(fill=tk.X, padx=4, pady=(0, 3))
+        self._label(line3, "jmp:", fg=MUTED, bg=BG2, width=5, anchor="w").pack(side=tk.LEFT)
+        ttk.Combobox(line3, textvariable=entry_vars["jmp_type"],
+                     values=["rel32", "absolute"], state="readonly",
+                     width=9).pack(side=tk.LEFT)
+        self._label(line3, "", fg=ACCENT, bg=BG2, font=(FONT, 8),
+                    textvariable=entry_vars["suggest"], wraplength=430,
+                    justify="left").pack(side=tk.LEFT, padx=(8, 0))
+
         self._hook_entries.append(entry)
 
     def _remove_hook_row(self, entry):
@@ -591,11 +614,27 @@ class GGModUI:
             entry["row"].destroy()
         self._hook_entries = []
 
+    def _show_jmp_suggestion(self, entry, hook_address=None):
+        """Compute + display the advisory rel32/absolute suggestion for a hook.
+
+        Advisory only — the real decision is _alloc_cave's automatic fallback at
+        apply time. Needs attach to know the module size/bitness."""
+        if not self.engine.is_attached():
+            entry["suggest"].set("")
+            return None
+        module = entry["module"].get().strip() or None
+        sug = self.engine.suggest_jmp_type(hook_address=hook_address,
+                                           module_name=module)
+        entry["suggest"].set("Suggested: {} — {}".format(
+            sug["jmp_type"], sug["reason"]))
+        return sug
+
     def _auto_steal(self, entry):
-        """Fill a hook's steal field with the capstone-computed minimum.
+        """Fill a hook's steal field with the capstone-computed minimum for the
+        selected jmp type (rel32 -> 5-byte, absolute -> 14-byte threshold).
 
         Needs an attached process so the disassembler matches the game's
-        bitness (x86/x64). Defaults to a rel32 (5-byte) jmp threshold.
+        bitness (x86/x64).
         """
         self.form_error_var.set("")
         if not self.engine.is_attached():
@@ -608,17 +647,21 @@ class GGModUI:
             self.form_error_var.set(
                 "Enter a valid AOB in this hook before auto-calculating steal.")
             return
+        # Advisory jmp-type suggestion (does not override the user's choice).
+        self._show_jmp_suggestion(entry)
+        jmp_type = entry["jmp_type"].get() or "rel32"
         pattern, mask = self.engine._parse_aob(aob_text)
         try:
-            steal = self.engine.compute_min_steal(pattern, jmp_type="rel32")
+            steal = self.engine.compute_min_steal(pattern, jmp_type=jmp_type)
         except engine.InsufficientBytesForJmpError as ex:
-            self.form_error_var.set("Auto-steal: {}".format(ex))
+            self.form_error_var.set("Auto-steal ({}): {}".format(jmp_type, ex))
             return
         except Exception as ex:                     # e.g. capstone missing
             self.form_error_var.set("Auto-steal failed: {}".format(ex))
             return
         entry["hook_offset"].set(str(steal))
-        msg = "Auto-steal: {} byte(s) (instruction-aligned, rel32).".format(steal)
+        msg = "Auto-steal: {} byte(s) (instruction-aligned, {}).".format(
+            steal, jmp_type)
         # Wildcards inside the stolen region can make the decode unreliable.
         if not all(mask[:steal]):
             msg += "  WARNING: AOB has wildcards within the steal region — verify."
@@ -694,6 +737,13 @@ class GGModUI:
             else:
                 _put("register/offset: not auto-filled — {}".format(
                     res.get("reason", "")), "warn")
+            # Advisory jmp-type suggestion for this address/module.
+            sug = self.engine.suggest_jmp_type(
+                hook_address=address, module_name=res.get("module"))
+            state["suggest"] = sug
+            _put("jmp type: suggested {} — {}".format(
+                sug["jmp_type"], sug["reason"]),
+                "ok" if sug["jmp_type"] == "rel32" else "warn")
             _put("")
             _put("decoded instructions:")
             for ins in res.get("instructions", []):
@@ -717,6 +767,12 @@ class GGModUI:
                 entry["module"].set(res["module"])
             if res.get("struct_offset") is not None:
                 self.form_vars["struct_offset"].set(res["struct_offset"])
+            # Pre-select + surface the advisory jmp type (user can still change).
+            sug = state.get("suggest")
+            if sug:
+                entry["jmp_type"].set(sug["jmp_type"])
+                entry["suggest"].set("Suggested: {} — {}".format(
+                    sug["jmp_type"], sug["reason"]))
             self.log(
                 "From address: filled AOB ({} match(es)){}{}.".format(
                     res.get("matches"),
@@ -732,6 +788,77 @@ class GGModUI:
         fill_btn = self._button(btns, "Fill fields", _fill)
         fill_btn.pack(side=tk.LEFT)
         fill_btn.config(state=tk.DISABLED)
+        self._button_ghost(btns, "Cancel", top.destroy).pack(side=tk.LEFT, padx=(6, 0))
+
+    def _paste_line(self, entry):
+        """Offline dialog: paste a disassembly line, fill register + offset.
+
+        Pure text parse (engine.parse_disasm_line) — needs no attached process.
+        Does NOT touch the AOB (supply that via CE / From address / by hand)."""
+        top = tk.Toplevel(self.root)
+        top.title("Paste disassembly line")
+        top.configure(bg=BG)
+        top.transient(self.root)
+        top.grab_set()
+
+        self._label(top, "Paste a line from Cheat Engine (e.g. "
+                    "\"0053FBBA - 89 7B 18 - mov [ebx+18],edi\"):",
+                    fg=MUTED, wraplength=440, justify="left").pack(
+                        anchor="w", padx=12, pady=(12, 4))
+        line_var = tk.StringVar()
+        line_entry = self._entry(top, line_var, width=60)
+        line_entry.pack(fill=tk.X, padx=12)
+        line_entry.focus_set()
+
+        result_txt = tk.Text(top, width=60, height=6, bg=BG3, fg=FG, relief=tk.FLAT,
+                             wrap=tk.WORD, font=(MONO, 9), state=tk.DISABLED)
+        result_txt.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
+        result_txt.tag_configure("ok", foreground=GREEN)
+        result_txt.tag_configure("warn", foreground=AMBER)
+
+        state = {"parsed": None}
+
+        def _put(text="", tag=None):
+            result_txt.config(state=tk.NORMAL)
+            result_txt.insert(tk.END, text + "\n", (tag,) if tag else ())
+            result_txt.config(state=tk.DISABLED)
+
+        def _parse():
+            result_txt.config(state=tk.NORMAL); result_txt.delete("1.0", tk.END)
+            result_txt.config(state=tk.DISABLED)
+            state["parsed"] = None
+            apply_btn.config(state=tk.DISABLED)
+            res = engine.parse_disasm_line(line_var.get())
+            if res.get("mnemonic"):
+                _put("mnemonic       : {}".format(res["mnemonic"]))
+            if res.get("memory_operand"):
+                _put("memory operand : {}".format(res["memory_operand"]))
+            reg, off = res.get("capture_register"), res.get("struct_offset")
+            if reg and off is not None:
+                _put("register       : {}".format(reg), "ok")
+                _put("struct_offset  : {} (hex)".format(off), "ok")
+                state["parsed"] = res
+                apply_btn.config(state=tk.NORMAL)
+            else:
+                _put("could not fill  : {}".format(res.get("reason", "")), "warn")
+
+        def _apply():
+            res = state["parsed"]
+            if not res:
+                return
+            entry["register"].set(res["capture_register"])
+            self.form_vars["struct_offset"].set(res["struct_offset"])
+            self.log("Paste line: register={}, struct_offset={} (AOB unchanged).".format(
+                res["capture_register"], res["struct_offset"]))
+            top.destroy()
+
+        btns = tk.Frame(top, bg=BG)
+        btns.pack(fill=tk.X, padx=12, pady=(0, 12))
+        self._button(btns, "Parse", _parse).pack(side=tk.LEFT)
+        line_entry.bind("<Return>", lambda _e: _parse())
+        apply_btn = self._button(btns, "Apply", _apply)
+        apply_btn.pack(side=tk.LEFT, padx=(6, 0))
+        apply_btn.config(state=tk.DISABLED)
         self._button_ghost(btns, "Cancel", top.destroy).pack(side=tk.LEFT, padx=(6, 0))
 
     def _add_form_row(self, key, label, widget_factory):
