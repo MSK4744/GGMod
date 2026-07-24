@@ -1034,8 +1034,9 @@ class TrainerEngine:
                 state["locked_ptr"] = initial
                 state["last_slot"] = initial
                 self._log(
-                    "slot locked (capture_once): 0x{:x} at attach — further hook "
-                    "fires ignored (mod '{}').".format(initial, name)
+                    "slot locked (capture_once): 0x{:x} at attach — writes target "
+                    "0x{:x} (locked_ptr+offset); further hook fires ignored "
+                    "(mod '{}').".format(initial, initial + struct_offset, name)
                 )
 
         def _loop():
@@ -1066,8 +1067,10 @@ class TrainerEngine:
                             state["locked_ptr"] = raw_ptr
                             ptr = raw_ptr
                             self._log(
-                                "slot locked (capture_once): 0x{:x} — further "
-                                "hook fires ignored (mod '{}').".format(raw_ptr, name)
+                                "slot locked (capture_once): 0x{:x} — writes "
+                                "target 0x{:x} (locked_ptr+offset); further hook "
+                                "fires ignored (mod '{}').".format(
+                                    raw_ptr, raw_ptr + struct_offset, name)
                             )
                         else:
                             ptr = 0
@@ -1079,9 +1082,10 @@ class TrainerEngine:
                         # skip the per-change line so a hot slot doesn't flood.
                         if not state["capture_once"]:
                             self._log(
-                                "slot updated: 0x{:x} -> 0x{:x} (mod '{}')".format(
-                                    state["last_slot"], ptr, name
-                                )
+                                "slot updated: 0x{:x} -> 0x{:x} (mod '{}'); "
+                                "writes target 0x{:x}".format(
+                                    state["last_slot"], ptr, name,
+                                    (ptr + struct_offset) if ptr else 0)
                             )
                         state["last_slot"] = ptr
                     if ptr:
@@ -1126,6 +1130,23 @@ class TrainerEngine:
         )
         return True
 
+    def _effective_ptr(self, entry):
+        """The base pointer a write should target for an active mod.
+
+        Once capture_once has locked, EVERY write path must use the latched
+        pointer (state['locked_ptr']) — the raw shared slot keeps receiving
+        garbage from the shared hook instruction, so reading it after lock
+        would compute the wrong address. Non-capture_once (or not-yet-locked)
+        mods fall back to the live slot value, exactly as before.
+
+        Returns (ptr, source) where source is 'locked_ptr' or 'slot' for logs.
+        """
+        state = entry.get("state") or {}
+        if state.get("capture_once") and state.get("locked_ptr"):
+            return state["locked_ptr"], "locked_ptr"
+        raw = self._read(entry["slot"], entry["ptr_size"])
+        return (int.from_bytes(raw, "little") if raw else 0), "slot"
+
     def set_once_trigger(self, mod_name):
         """For poll_mode 'set_once': write mod['value'] once, now."""
         entry = self._active.get(mod_name)
@@ -1135,14 +1156,14 @@ class TrainerEngine:
         mod = next((m for m in self.mods if m.get("name") == mod_name), None)
         if mod is None:
             return
-        raw = self._read(entry["slot"], entry["ptr_size"])
-        ptr = int.from_bytes(raw, "little") if raw else 0
+        ptr, src = self._effective_ptr(entry)
         if not ptr:
             self._log("set_once '{}': no pointer captured yet.".format(mod_name))
             return
         target = ptr + entry["struct_offset"]
         self._write(target, struct.pack("<i", _parse_int(mod.get("value"))))
-        self._log("set_once '{}': wrote value at {:#x}.".format(mod_name, target))
+        self._log("set_once '{}': wrote value at {:#x} ({}+offset).".format(
+            mod_name, target, src))
 
     def recapture(self, mod_name):
         """Unlock a capture_once mod so the next hook fire re-latches the slot.
@@ -1220,11 +1241,13 @@ class TrainerEngine:
             self._log("force_set: '{}' is not a valid integer.".format(value))
             return False
 
-        raw = self._read(entry["slot"], entry["ptr_size"])
-        ptr = int.from_bytes(raw, "little") if raw else 0
+        # Prefer the locked pointer once capture_once has latched — the raw slot
+        # keeps drifting to garbage from the shared hook, so reading it here
+        # would compute the wrong target (this was the capture_once force-set bug).
+        ptr, src = self._effective_ptr(entry)
         if not ptr:
             self._log(
-                "force_set: '{}' has no pointer captured yet (slot is 0x0); "
+                "force_set: '{}' has no pointer captured yet (0x0); "
                 "trigger the hooked code path in-game first.".format(mod_name)
             )
             return False
@@ -1235,7 +1258,8 @@ class TrainerEngine:
         except Exception as exc:
             self._log("force_set: '{}' write failed: {}".format(mod_name, exc))
             return False
-        self._log("Force-set '{}' -> {} (one-time write)".format(mod_name, value))
+        self._log("Force-set '{}' -> {} at {:#x} ({}+offset).".format(
+            mod_name, value, target, src))
         return True
 
     # ==================================================================
