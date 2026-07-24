@@ -22,6 +22,11 @@ from ctypes import wintypes
 
 import pymem
 
+try:
+    import capstone
+except Exception:                       # capstone is optional at import time
+    capstone = None                     # auto-steal helpers raise if it's absent
+
 # ---------------------------------------------------------------------------
 # Win32 bindings we need beyond what pymem exposes conveniently.
 # ---------------------------------------------------------------------------
@@ -70,6 +75,39 @@ class JmpOutOfRangeError(Exception):
         self.rel = rel
         super().__init__(
             "jmp target {:#x} out of rel32 range (rel={})".format(dst_addr, rel)
+        )
+
+
+class InsufficientBytesForJmpError(Exception):
+    """Raised when the AOB is too short to cover whole instructions up to the
+    jmp size threshold, so a correct steal length cannot be computed. Means the
+    user must supply a longer AOB (more trailing bytes past the hook)."""
+
+    def __init__(self, required, got, aob_len):
+        self.required = required      # bytes the jmp needs (5 or 14)
+        self.got = got                # bytes of fully-decoded instructions
+        self.aob_len = aob_len
+        super().__init__(
+            "AOB decodes to only {} instruction byte(s); need >= {} to fit the "
+            "jmp. Provide a longer AOB (a few more bytes past the hook).".format(
+                got, required)
+        )
+
+
+class MidInstructionStealError(Exception):
+    """Raised when a manually-entered steal value does not fall on an
+    instruction boundary — it would cut an instruction in half and crash the
+    game. Carries the surrounding valid boundaries for a helpful message."""
+
+    def __init__(self, steal, lo, hi, boundaries):
+        self.steal = steal
+        self.lo = lo                  # nearest boundary below steal
+        self.hi = hi                  # nearest boundary above steal
+        self.boundaries = boundaries
+        super().__init__(
+            "steal {} lands mid-instruction (splits the instruction between "
+            "byte {} and byte {}). Use {} or {} instead.".format(
+                steal, lo, hi, lo, hi)
         )
 
 
@@ -206,10 +244,36 @@ class TrainerEngine:
     # ==================================================================
     # Low-level memory helpers
     # ==================================================================
-    def _main_module_range(self):
-        """Return (base_address, size) of the main executable module."""
-        base = self.pm.base_address
+    def _main_module_range(self, module_name=None):
+        """Return (base_address, size) for a loaded module.
+
+        module_name=None (default, unchanged behavior) -> the main executable
+        module. This keeps every existing config (POP1/POP2/GTA V/PRAGMATA),
+        which has no per-hook 'module' field, scanning the main .exe exactly as
+        before.
+
+        module_name given (e.g. 'GameAssembly.dll') -> that module's range,
+        matched case-insensitively by base name; the extension may be omitted.
+        Returns (0, 0) if the named module is not loaded, so callers abort with
+        a clear diagnostic instead of scanning the wrong range.
+        """
         try:
+            if module_name:
+                target = module_name.lower()
+                mods = list(self.pm.list_modules())
+                for module in mods:
+                    if module.name.lower() == target:
+                        return int(module.lpBaseOfDll), int(module.SizeOfImage)
+                # Forgiving match: allow the extension to be dropped
+                # ('GameAssembly' matching 'GameAssembly.dll').
+                for module in mods:
+                    if module.name.lower().rsplit(".", 1)[0] == target:
+                        return int(module.lpBaseOfDll), int(module.SizeOfImage)
+                self._log("Module '{}' not found among {} loaded modules.".format(
+                    module_name, len(mods)))
+                return 0, 0
+
+            base = self.pm.base_address
             for module in self.pm.list_modules():
                 if int(module.lpBaseOfDll) == int(base):
                     return int(base), int(module.SizeOfImage)
@@ -217,8 +281,8 @@ class TrainerEngine:
             first = next(iter(self.pm.list_modules()))
             return int(first.lpBaseOfDll), int(first.SizeOfImage)
         except Exception as exc:
-            self._log("Could not determine module size: {}".format(exc))
-            return int(base), 0
+            self._log("Could not determine module range: {}".format(exc))
+            return (0, 0) if module_name else (int(self.pm.base_address), 0)
 
     def _read(self, address, size):
         try:
@@ -265,8 +329,12 @@ class TrainerEngine:
         return time.strftime("%H:%M:%S", time.localtime(now)) + \
             ".{:03d}".format(int((now % 1) * 1000))
 
-    def scan_aob(self, aob_pattern, progress_callback=None):
-        """Scan the main module and return ALL addresses matching the pattern.
+    def scan_aob(self, aob_pattern, progress_callback=None, module_name=None):
+        """Scan a module and return ALL addresses matching the pattern.
+
+        module_name=None scans the main executable module (default). A module
+        name (e.g. 'GameAssembly.dll') scans that module instead — needed for
+        Unity/IL2CPP titles whose game logic lives in a separate module.
 
         Reads in overlapping chunks so matches that straddle a chunk boundary
         are still found, and so we never pull the whole module into memory at
@@ -293,12 +361,16 @@ class TrainerEngine:
         # Resolving the module range walks the process module list; log around
         # it so a stall *here* (before any read) is distinguishable in the log
         # from a stall inside the read loop.
-        self._log("[{}] scan_aob: resolving main module range...".format(self._ts()))
-        base, size = self._main_module_range()
-        self._log("[{}] scan_aob: module range resolved base={:#x} size={} "
-                  "({:.1f} MB).".format(self._ts(), base, size, size / (1024 * 1024)))
+        mod_label = module_name if module_name else "main module"
+        self._log("[{}] scan_aob: resolving range for {}...".format(
+            self._ts(), mod_label))
+        base, size = self._main_module_range(module_name)
+        self._log("[{}] scan_aob: {} range resolved base={:#x} size={} "
+                  "({:.1f} MB).".format(self._ts(), mod_label, base, size,
+                                        size / (1024 * 1024)))
         if size == 0:
-            self._log("scan_aob: unknown module size, aborting scan.")
+            self._log("scan_aob: {} unavailable (size 0), aborting scan.".format(
+                mod_label))
             return []
 
         CHUNK = 0x10000                 # 64 KB
@@ -479,6 +551,73 @@ class TrainerEngine:
     def _min_jmp_len(self, use_rel=True):
         return 5 if (not self._is64 or use_rel) else 14
 
+    # ------------------------------------------------------------------
+    # capstone-backed steal computation (edit-time aid; not a schema change)
+    # ------------------------------------------------------------------
+    def _make_disassembler(self, is64=None):
+        """Build a capstone x86 disassembler matching the target's bitness.
+
+        is64=None uses the attached process's detected bitness (self._is64),
+        so decoding matches exactly how the engine encodes jmps for it.
+        """
+        if capstone is None:
+            raise RuntimeError(
+                "capstone is not installed; cannot auto-calculate steal length.")
+        if is64 is None:
+            is64 = self._is64
+        mode = capstone.CS_MODE_64 if is64 else capstone.CS_MODE_32
+        return capstone.Cs(capstone.CS_ARCH_X86, mode)
+
+    def steal_boundaries(self, aob_bytes, is64=None):
+        """Return the cumulative instruction-end offsets within aob_bytes.
+
+        e.g. [3, 9, 15] means instructions end at bytes 3, 9 and 15 — those are
+        the ONLY steal values that don't split an instruction. Decoding stops at
+        the first byte capstone can't decode, so the list only spans the region
+        that disassembled cleanly.
+        """
+        md = self._make_disassembler(is64)
+        bounds = []
+        total = 0
+        for insn in md.disasm(bytes(aob_bytes), 0):
+            total += insn.size
+            bounds.append(total)
+        return bounds
+
+    def compute_min_steal(self, aob_bytes, jmp_type="rel32", is64=None):
+        """Smallest instruction-aligned steal length >= the jmp size.
+
+        Walks instructions from the hook, summing sizes, and returns the first
+        cumulative total that reaches the jmp threshold (5 for rel32, 14 for a
+        14-byte absolute jmp). Raises InsufficientBytesForJmpError if the AOB
+        runs out before the threshold is reached.
+        """
+        min_len = 14 if jmp_type in ("abs", "absolute") else 5
+        total = 0
+        for boundary in self.steal_boundaries(aob_bytes, is64):
+            total = boundary
+            if total >= min_len:
+                return total
+        raise InsufficientBytesForJmpError(min_len, total, len(aob_bytes))
+
+    def validate_steal(self, aob_bytes, steal, is64=None):
+        """Guard a manually-entered steal value against mid-instruction cuts.
+
+        Raises MidInstructionStealError if `steal` falls strictly inside a
+        decoded instruction. Returns the boundary list on success. If the bytes
+        can't be disassembled (empty list) or `steal` is beyond the decoded
+        region (can't be verified from this AOB), it does NOT block — best
+        effort, so we never reject a value we cannot actually prove is wrong.
+        """
+        bounds = self.steal_boundaries(aob_bytes, is64)
+        if not bounds or steal in bounds:
+            return bounds
+        if steal < bounds[-1]:
+            lo = max((b for b in bounds if b < steal), default=0)
+            hi = min(b for b in bounds if b > steal)
+            raise MidInstructionStealError(steal, lo, hi, bounds)
+        return bounds  # steal >= last boundary: beyond decoded AOB, unverifiable
+
     @staticmethod
     def _mod_hooks(mod):
         """Return a mod's hook list.
@@ -571,11 +710,14 @@ class TrainerEngine:
             aob = hook.get("aob", "")
             steal_len = _parse_int(hook.get("steal_len", hook.get("hook_offset")))
             reg = hook.get("capture_register", "eax")
-            matches = self.scan_aob(aob, progress_callback=progress_callback)
+            module = hook.get("module")            # None -> main module
+            matches = self.scan_aob(aob, progress_callback=progress_callback,
+                                    module_name=module)
             total_matches += len(matches)
             hr = {
                 "index": i, "aob": aob, "capture_register": reg,
                 "steal_len": steal_len, "matches": len(matches),
+                "module": module or "main module",
                 "match_addresses": ["0x{:X}".format(a) for a in matches[:20]],
                 "status": "ready", "original_bytes": None,
                 "cave_preview": None, "warnings": [],
@@ -735,10 +877,16 @@ class TrainerEngine:
         or None on failure. Reuses the proven single-hook cave-building path
         (_alloc_cave / _build_cave_code / _enc_jmp) unchanged.
         """
-        hook_addr = self.scan_aob(hook.get("aob", ""))[0]  # caller pre-validated
+        # caller pre-validated exactly one match in this hook's module.
+        hook_addr = self.scan_aob(
+            hook.get("aob", ""), module_name=hook.get("module"))[0]
         reg_name = hook.get("capture_register", "eax")
         steal_len = _parse_int(hook.get("steal_len", hook.get("hook_offset")))
 
+        # _alloc_cave places the cave near hook_addr — which is the hook's REAL
+        # runtime address in whatever module it lives in (main .exe or a DLL
+        # like GameAssembly.dll), so rel32 reach is computed correctly wherever
+        # the hook actually is; no assumption that it's near the main exe.
         cave, use_rel = self._alloc_cave(hook_addr)
         min_len = self._min_jmp_len(use_rel)
         if steal_len < min_len:
@@ -809,24 +957,28 @@ class TrainerEngine:
         # --- Pre-validate ALL hooks before writing anything. A mod with only
         #     some hooks working behaves inconsistently, so it's all-or-nothing.
         for i, hook in enumerate(hooks):
-            n = len(self.scan_aob(hook.get("aob", "")))
+            n = len(self.scan_aob(hook.get("aob", ""),
+                                  module_name=hook.get("module")))
             if n != 1:
                 self._log(
-                    "pointer_capture '{}': hook #{} AOB has {} matches (need "
-                    "exactly 1). Aborting whole mod.".format(name, i, n)
+                    "pointer_capture '{}': hook #{} AOB has {} matches in {} "
+                    "(need exactly 1). Aborting whole mod.".format(
+                        name, i, n, hook.get("module") or "main module")
                 )
                 return False
 
         ptr_size = 8 if self._is64 else 4
         struct_offset = _parse_int(mod.get("struct_offset"))
         poll_mode = mod.get("poll_mode", "never_decrease")
+        capture_once = bool(mod.get("capture_once"))
 
         # --- ONE shared slot for the whole mod. Its own allocation (near hook
         #     #0 on x64 so rip-relative movs from every hook's cave can reach).
         #     VirtualAllocEx is page-aligned, so slot_addr is pointer-aligned
         #     and pointer-sized stores from concurrent hooks are atomic (no
         #     torn pointer); only the first ptr_size bytes are used.
-        slot_region, _ = self._alloc_cave(self.scan_aob(hooks[0].get("aob", ""))[0])
+        slot_region, _ = self._alloc_cave(self.scan_aob(
+            hooks[0].get("aob", ""), module_name=hooks[0].get("module"))[0])
         slot_addr = slot_region + _SLOT_OFF
         self._write(slot_addr, b"\x00" * ptr_size)
 
@@ -850,6 +1002,22 @@ class TrainerEngine:
             caves.append(cave)
             patches.append(patch_entry)
 
+        stop = threading.Event()
+        # "max": never_decrease tracking. "last_slot": last-seen slot value, so
+        # we can log only when the captured pointer CHANGES (not every tick).
+        # Init to 0 since the slot was just zeroed at apply.
+        # "value": the live value the poll thread writes (hard_set) or clamps to
+        # (clamp_min). set_mod_value() reassigns this key at runtime; a single
+        # dict-key assignment is atomic under the GIL, so no lock is needed.
+        # capture_once fields:
+        #   "capture_once": lock the pointer after the first non-zero capture.
+        #   "locked_ptr":   the latched pointer (0 = not yet locked).
+        #   "recapture":    UI-set flag asking the loop to unlock + relatch.
+        state = {
+            "max": None, "last_slot": 0, "value": _parse_int(mod.get("value")),
+            "capture_once": capture_once, "locked_ptr": 0, "recapture": False,
+        }
+
         # (e) Best-effort attach-time capture — see single-hook note: the slot
         # only holds a real pointer AFTER a hooked instruction runs in-game.
         if mod.get("capture_at_attach"):
@@ -859,27 +1027,62 @@ class TrainerEngine:
                 "pointer_capture '{}': attach-time capture (best-effort) = "
                 "{:#x}. If 0, no hooked path has executed yet.".format(name, initial)
             )
-
-        stop = threading.Event()
-        # "max": never_decrease tracking. "last_slot": last-seen slot value, so
-        # we can log only when the captured pointer CHANGES (not every tick).
-        # Init to 0 since the slot was just zeroed at apply.
-        # "value": the live value the poll thread writes (hard_set) or clamps to
-        # (clamp_min). set_mod_value() reassigns this key at runtime; a single
-        # dict-key assignment is atomic under the GIL, so no lock is needed.
-        state = {"max": None, "last_slot": 0, "value": _parse_int(mod.get("value"))}
+            # capture_once + capture_at_attach: if the attach read already got a
+            # non-zero pointer, lock to it now (it counts as the "first fire").
+            # If it was 0x0, stay unlocked so the first real hook fire locks it.
+            if capture_once and initial:
+                state["locked_ptr"] = initial
+                state["last_slot"] = initial
+                self._log(
+                    "slot locked (capture_once): 0x{:x} at attach — further hook "
+                    "fires ignored (mod '{}').".format(initial, name)
+                )
 
         def _loop():
             while not stop.is_set():
                 try:
-                    raw = self._read(slot_addr, ptr_size)
-                    ptr = int.from_bytes(raw, "little") if raw else 0
-                    if ptr != state["last_slot"]:
+                    # Recapture: unlock and clear the slot so the NEXT non-zero
+                    # hook fire is captured fresh (not the stale slot value).
+                    if state["capture_once"] and state["recapture"]:
+                        state["recapture"] = False
+                        state["locked_ptr"] = 0
+                        state["last_slot"] = 0
+                        self._write(slot_addr, b"\x00" * ptr_size)
                         self._log(
-                            "slot updated: 0x{:x} -> 0x{:x} (mod '{}')".format(
-                                state["last_slot"], ptr, name
-                            )
+                            "recapture (capture_once): '{}' unlocked; slot "
+                            "cleared, next hook fire recaptures.".format(name)
                         )
+
+                    raw = self._read(slot_addr, ptr_size)
+                    raw_ptr = int.from_bytes(raw, "little") if raw else 0
+
+                    # Resolve the effective pointer. capture_once latches the
+                    # first non-zero value and then ignores the (garbage-prone)
+                    # slot; normal mods track the live slot every tick.
+                    if state["capture_once"]:
+                        if state["locked_ptr"]:
+                            ptr = state["locked_ptr"]
+                        elif raw_ptr:
+                            state["locked_ptr"] = raw_ptr
+                            ptr = raw_ptr
+                            self._log(
+                                "slot locked (capture_once): 0x{:x} — further "
+                                "hook fires ignored (mod '{}').".format(raw_ptr, name)
+                            )
+                        else:
+                            ptr = 0
+                    else:
+                        ptr = raw_ptr
+
+                    if ptr != state["last_slot"]:
+                        # capture_once already logs its lock/recapture events;
+                        # skip the per-change line so a hot slot doesn't flood.
+                        if not state["capture_once"]:
+                            self._log(
+                                "slot updated: 0x{:x} -> 0x{:x} (mod '{}')".format(
+                                    state["last_slot"], ptr, name
+                                )
+                            )
                         state["last_slot"] = ptr
                     if ptr:
                         target = ptr + struct_offset
@@ -940,6 +1143,26 @@ class TrainerEngine:
         target = ptr + entry["struct_offset"]
         self._write(target, struct.pack("<i", _parse_int(mod.get("value"))))
         self._log("set_once '{}': wrote value at {:#x}.".format(mod_name, target))
+
+    def recapture(self, mod_name):
+        """Unlock a capture_once mod so the next hook fire re-latches the slot.
+
+        Lets the user grab a fresh pointer (e.g. after switching to the right
+        object) without disabling/re-enabling the mod. The poll thread performs
+        the actual unlock + slot-clear on its next tick (flag set atomically).
+        """
+        entry = self._active.get(mod_name)
+        if entry is None or entry.get("kind") != "pointer_capture":
+            self._log("recapture: '{}' is not an active pointer_capture mod.".format(
+                mod_name))
+            return False
+        state = entry.get("state")
+        if not state or not state.get("capture_once"):
+            self._log("recapture: '{}' is not a capture_once mod.".format(mod_name))
+            return False
+        state["recapture"] = True            # atomic; picked up next poll tick
+        self._log("recapture requested for '{}'.".format(mod_name))
+        return True
 
     def set_mod_value(self, name, new_value):
         """Live-update the value an active hard_set / clamp_min mod writes.

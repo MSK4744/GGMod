@@ -16,6 +16,8 @@ import queue
 import re
 import sys
 import threading
+
+import engine  # for the capstone-backed steal exceptions (Insufficient/Mid)
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 
@@ -328,6 +330,17 @@ class GGModUI:
         self._label(self.force_frame, "", fg=RED,
                     textvariable=self.force_err_var).pack(side=tk.LEFT, padx=6)
 
+        # ---- Recapture (only active capture_once pointer_capture mods) ----
+        # Unlocks the latched pointer so the next hook fire re-grabs it.
+        self.recapture_frame = tk.Frame(left, bg=BG)
+        self._label(self.recapture_frame, "Capture-once:", fg=MUTED).pack(side=tk.LEFT)
+        self.recapture_btn = self._button(
+            self.recapture_frame, "Recapture", self.on_recapture)
+        self.recapture_btn.pack(side=tk.LEFT, padx=(2, 6))
+        self._label(self.recapture_frame,
+                    "unlock & grab the pointer on the next hook fire",
+                    fg=MUTED, font=(FONT, 8)).pack(side=tk.LEFT)
+
         # ---- Right: notebook (Selected Mod / Add Mod) ----
         right = tk.Frame(main, bg=BG, width=430)
         right.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(12, 0))
@@ -446,6 +459,18 @@ class GGModUI:
             ),
         )
 
+        # capture_once: latch the pointer on the first non-zero fire, then stop
+        # listening (for shared setters that fire for many unrelated objects).
+        self.form_vars["capture_once"] = tk.BooleanVar(value=False)
+        self._add_form_row(
+            "capture_once", "Capture once (lock after first fire)",
+            lambda parent: tk.Checkbutton(
+                parent, variable=self.form_vars["capture_once"],
+                bg=BG, fg=FG, selectcolor=BG3, activebackground=BG,
+                activeforeground=FG,
+            ),
+        )
+
         self.form_vars["struct_offset"] = tk.StringVar()
         self._add_form_row("struct_offset", "Struct offset",
                            entry(self.form_vars["struct_offset"]))
@@ -500,6 +525,7 @@ class GGModUI:
             "aob": tk.StringVar(value=prefill.get("aob", "")),
             "hook_offset": tk.StringVar(value=str(prefill.get("hook_offset", ""))),
             "register": tk.StringVar(value=prefill.get("capture_register", "esi")),
+            "module": tk.StringVar(value=prefill.get("module", "") or ""),
         }
 
         line1 = tk.Frame(row, bg=BG2)
@@ -517,10 +543,26 @@ class GGModUI:
                  insertbackground=FG, relief=tk.SOLID, bd=1,
                  highlightthickness=1, highlightbackground=BORDER,
                  highlightcolor=ACCENT).pack(side=tk.LEFT)
+        entry = {"row": row, **entry_vars}
+        # Auto-calculate the instruction-aligned steal length from the AOB via
+        # capstone. Fills the steal field; the user can still override it.
+        tk.Button(
+            line2, text="Auto", command=lambda: self._auto_steal(entry),
+            bg=ACCENT2, fg=WHITE, activebackground=ACCENT, activeforeground=WHITE,
+            relief=tk.FLAT, cursor="hand2", font=(FONT, 8, "bold"), padx=6,
+        ).pack(side=tk.LEFT, padx=(4, 0))
         self._label(line2, "reg:", fg=MUTED, bg=BG2).pack(side=tk.LEFT, padx=(8, 2))
         ttk.Combobox(line2, textvariable=entry_vars["register"], values=REGISTERS,
                      state="readonly", width=8).pack(side=tk.LEFT)
-        entry = {"row": row, **entry_vars}
+        # Optional per-hook module target: blank = main .exe; e.g. for Unity/
+        # IL2CPP titles whose logic is in GameAssembly.dll.
+        self._label(line2, "module:", fg=MUTED, bg=BG2).pack(side=tk.LEFT, padx=(8, 2))
+        tk.Entry(line2, textvariable=entry_vars["module"], width=16, bg=BG3, fg=FG,
+                 insertbackground=FG, relief=tk.SOLID, bd=1,
+                 highlightthickness=1, highlightbackground=BORDER,
+                 highlightcolor=ACCENT).pack(side=tk.LEFT)
+        self._label(line2, "(blank = main exe)", fg=MUTED, bg=BG2,
+                    font=(FONT, 8)).pack(side=tk.LEFT, padx=(4, 0))
         tk.Button(
             line2, text="✕", command=lambda: self._remove_hook_row(entry),
             bg=BG2, fg=RED, activebackground=RED, activeforeground=BG,
@@ -537,6 +579,42 @@ class GGModUI:
         for entry in list(self._hook_entries):
             entry["row"].destroy()
         self._hook_entries = []
+
+    def _auto_steal(self, entry):
+        """Fill a hook's steal field with the capstone-computed minimum.
+
+        Needs an attached process so the disassembler matches the game's
+        bitness (x86/x64). Defaults to a rel32 (5-byte) jmp threshold.
+        """
+        self.form_error_var.set("")
+        if not self.engine.is_attached():
+            self.form_error_var.set(
+                "Attach to the game first — auto-steal needs the process "
+                "bitness (x86 vs x64) to disassemble correctly.")
+            return
+        aob_text = entry["aob"].get().strip()
+        if not aob_text or not self._valid_aob(aob_text):
+            self.form_error_var.set(
+                "Enter a valid AOB in this hook before auto-calculating steal.")
+            return
+        pattern, mask = self.engine._parse_aob(aob_text)
+        try:
+            steal = self.engine.compute_min_steal(pattern, jmp_type="rel32")
+        except engine.InsufficientBytesForJmpError as ex:
+            self.form_error_var.set("Auto-steal: {}".format(ex))
+            return
+        except Exception as ex:                     # e.g. capstone missing
+            self.form_error_var.set("Auto-steal failed: {}".format(ex))
+            return
+        entry["hook_offset"].set(str(steal))
+        msg = "Auto-steal: {} byte(s) (instruction-aligned, rel32).".format(steal)
+        # Wildcards inside the stolen region can make the decode unreliable.
+        if not all(mask[:steal]):
+            msg += "  WARNING: AOB has wildcards within the steal region — verify."
+            self.form_error_var.set(
+                "Auto-steal used {}, but this AOB has wildcards in the steal "
+                "region — double-check it disassembled correctly.".format(steal))
+        self.log(msg)
 
     def _add_form_row(self, key, label, widget_factory):
         row = tk.Frame(self.form, bg=BG)
@@ -565,7 +643,8 @@ class GGModUI:
         if ptr:
             # pointer_capture uses the dynamic hooks section for AOBs, not the
             # flat 'aob' row.
-            visible |= {"capture_at_attach", "struct_offset", "poll_mode"}
+            visible |= {"capture_at_attach", "capture_once", "struct_offset",
+                        "poll_mode"}
             if poll_mode in ("clamp_min", "hard_set"):
                 visible.add("value")
 
@@ -1078,6 +1157,7 @@ class GGModUI:
         self.form_vars["freeze_mode"].set(mod.get("freeze_mode", FREEZE_MODES[0]))
         self.form_vars["poll_mode"].set(mod.get("poll_mode", POLL_MODES[0]))
         self.form_vars["capture_at_attach"].set(bool(mod.get("capture_at_attach", False)))
+        self.form_vars["capture_once"].set(bool(mod.get("capture_once", False)))
         self.form_vars["name"].set(mod.get("name", ""))
         self._clear_hook_rows()
 
@@ -1098,6 +1178,7 @@ class GGModUI:
                     "aob": hook.get("aob", ""),
                     "hook_offset": "" if steal is None else steal,
                     "capture_register": hook.get("capture_register", "esi"),
+                    "module": hook.get("module", ""),
                 })
 
         if self.notes_text_widget is not None:
@@ -1178,6 +1259,20 @@ class GGModUI:
                 self.force_frame.pack(fill=tk.X, pady=(0, 6))
         else:
             self.force_frame.pack_forget()
+
+        # Recapture: only active pointer_capture mods with capture_once enabled.
+        if is_active_pc and mod.get("capture_once"):
+            if not self.recapture_frame.winfo_manager():
+                self.recapture_frame.pack(fill=tk.X, pady=(0, 6))
+        else:
+            self.recapture_frame.pack_forget()
+
+    def on_recapture(self):
+        """Unlock a capture_once mod so the next hook fire re-latches the slot."""
+        mod = self.selected_mod
+        if mod is None:
+            return
+        self.engine.recapture(mod.get("name"))
 
     def on_force_set(self):
         """One-time immediate write to [captured_ptr + struct_offset]."""
@@ -1476,6 +1571,9 @@ class GGModUI:
                     hr.get("index"), mark, hr.get("matches"),
                     hr.get("capture_register"), hr.get("steal_len")))
                 put("   status : {}".format(hr.get("status")))
+                # Always show which module was scanned — makes blocked_no_match
+                # diagnosable (wrong/missing module vs. wrong AOB).
+                put("   module : {}".format(hr.get("module") or "main module"))
                 put_matches(hr.get("match_addresses") or [], hr.get("matches"),
                             ok, indent="   ")
                 put("   aob    : {}".format(hr.get("aob")))
@@ -1626,14 +1724,36 @@ class GGModUI:
                     if not ho:
                         errors.append("Hook {}: hook offset (steal len) required.".format(i + 1))
                     else:
-                        int(ho, 0)  # raises ValueError -> caught below
-                    hooks.append({
+                        steal_val = int(ho, 0)  # raises ValueError -> caught below
+                        # Mid-instruction guard: if attached (bitness known) and
+                        # the steal region has no wildcards, refuse a value that
+                        # splits an instruction — catching it here, not at Apply.
+                        if aob and self._valid_aob(aob) and self.engine.is_attached():
+                            pattern, mask = self.engine._parse_aob(aob)
+                            if all(mask[:steal_val]):  # wildcards -> can't verify
+                                try:
+                                    self.engine.validate_steal(pattern, steal_val)
+                                except engine.MidInstructionStealError as ex:
+                                    errors.append("Hook {}: steal {} splits an "
+                                                  "instruction — use {} or {}.".format(
+                                                      i + 1, steal_val, ex.lo, ex.hi))
+                    hook_obj = {
                         "aob": aob.upper(),
                         "hook_offset": int(ho, 0) if ho else None,
                         "capture_register": e["register"].get(),
-                    })
+                    }
+                    # Only persist 'module' when set, so configs without a
+                    # module target stay byte-for-byte as before (main exe).
+                    module = e.get("module").get().strip() if e.get("module") else ""
+                    if module:
+                        hook_obj["module"] = module
+                    hooks.append(hook_obj)
                 mod["hooks"] = hooks
                 mod["capture_at_attach"] = bool(v["capture_at_attach"])
+                # Persist capture_once ONLY when enabled, so existing configs
+                # (and diffs) that don't use it stay byte-for-byte unchanged.
+                if v["capture_once"]:
+                    mod["capture_once"] = True
                 if not v["struct_offset"].strip():
                     errors.append("Struct offset is required.")
                 else:

@@ -1,0 +1,7 @@
+# GGMod runtime dependencies
+pymem
+keyboard
+capstone        # x86/x64 disassembler — auto-calculates hook "steal" length
+
+# Build-time only (bundling the standalone .exe)
+pyinstaller
