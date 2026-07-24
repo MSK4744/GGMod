@@ -472,7 +472,7 @@ class GGModUI:
         )
 
         self.form_vars["struct_offset"] = tk.StringVar()
-        self._add_form_row("struct_offset", "Struct offset",
+        self._add_form_row("struct_offset", "Struct offset (hex)",
                            entry(self.form_vars["struct_offset"]))
 
         self.form_vars["poll_mode"] = tk.StringVar(value=POLL_MODES[0])

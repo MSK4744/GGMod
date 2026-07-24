@@ -120,6 +120,25 @@ def _parse_int(value, default=0):
     return int(str(value), 0)  # base 0 handles "0x10" and "16"
 
 
+def _parse_offset(value, default=0):
+    """Parse a struct offset, which is HEX by convention.
+
+    Memory offsets come from Cheat Engine, which shows them in hex, so a bare
+    "18" means 0x18 (24), and "0x18" also means 0x18. This is deliberately NOT
+    _parse_int (base 0), which would misread bare "18" as decimal 18 (0x12) and
+    reject a bare "19C" outright. An int is treated as already resolved and
+    passed through unchanged.
+    """
+    if value is None:
+        return default
+    if isinstance(value, int):
+        return value
+    s = str(value).strip()
+    if not s:
+        return default
+    return int(s, 16)  # accepts an optional "0x" prefix too
+
+
 class TrainerEngine:
     def __init__(self, log_callback=None):
         self._log = log_callback if log_callback else (lambda msg: None)
@@ -968,7 +987,7 @@ class TrainerEngine:
                 return False
 
         ptr_size = 8 if self._is64 else 4
-        struct_offset = _parse_int(mod.get("struct_offset"))
+        struct_offset = _parse_offset(mod.get("struct_offset"))
         poll_mode = mod.get("poll_mode", "never_decrease")
         capture_once = bool(mod.get("capture_once"))
 
