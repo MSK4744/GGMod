@@ -21,8 +21,16 @@ def main():
         if ui is not None:
             ui.log(message)
 
+    # Verbose per-keydown hotkey diagnostics go to the separate collapsible
+    # Key Input Log panel instead of flooding the main log.
+    def key_log_callback(message: str):
+        ui = ui_holder.get("ui")
+        if ui is not None:
+            ui.key_log(message)
+
     engine = TrainerEngine(log_callback=log_callback)
-    hotkeys = HotkeyManager(log_callback=log_callback)
+    hotkeys = HotkeyManager(
+        log_callback=log_callback, key_log_callback=key_log_callback)
 
     ui = GGModUI(engine, hotkeys)
     ui_holder["ui"] = ui

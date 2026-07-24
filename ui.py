@@ -78,6 +78,9 @@ class GGModUI:
         self.preview_ready_for = None # name of mod whose last preview was ready
 
         self._log_queue = queue.Queue()
+        # Separate queue for the verbose per-keydown hotkey diagnostics, so they
+        # don't flood the main log; drained into a collapsible panel.
+        self._key_log_queue = queue.Queue()
         # mod name -> hotkey string currently registered as a global hotkey.
         self._bound = {}
         # Note-column tooltip state.
@@ -685,9 +688,54 @@ class GGModUI:
         self.log_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.config(command=self.log_widget.yview)
 
+        # ---- Collapsible "Key Input Log" (verbose per-keydown diagnostics) ----
+        self._key_log_open = False
+        khead = tk.Frame(frame, bg=BG)
+        khead.pack(fill=tk.X, pady=(6, 0))
+        self._key_log_toggle = tk.Button(
+            khead, text="▸ Key Input Log", command=self._toggle_key_log,
+            bg=BG, fg=MUTED, activebackground=BG, activeforeground=ACCENT,
+            relief=tk.FLAT, cursor="hand2", font=(FONT, 9, "bold"), anchor="w",
+            bd=0, padx=0,
+        )
+        self._key_log_toggle.pack(side=tk.LEFT)
+        self._label(khead, "(hotkey scan-code matching)", fg=MUTED,
+                    font=(FONT, 8)).pack(side=tk.LEFT, padx=(6, 0))
+        self._button_ghost(khead, "Clear", self._clear_key_log).pack(side=tk.RIGHT)
+
+        self._key_log_body = tk.Frame(frame, bg=BG)   # packed only when open
+        kbar = tk.Scrollbar(self._key_log_body)
+        kbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.key_log_widget = tk.Text(
+            self._key_log_body, height=6, bg=BG3, fg=MUTED, insertbackground=FG,
+            font=(MONO, 9), wrap=tk.NONE, relief=tk.FLAT,
+            yscrollcommand=kbar.set, state=tk.DISABLED,
+        )
+        self.key_log_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        kbar.config(command=self.key_log_widget.yview)
+
+    def _toggle_key_log(self):
+        self._key_log_open = not self._key_log_open
+        if self._key_log_open:
+            self._key_log_body.pack(fill=tk.BOTH, expand=True)
+            self._key_log_toggle.config(text="▾ Key Input Log")
+        else:
+            self._key_log_body.pack_forget()
+            self._key_log_toggle.config(text="▸ Key Input Log")
+
+    def _clear_key_log(self):
+        self.key_log_widget.config(state=tk.NORMAL)
+        self.key_log_widget.delete("1.0", tk.END)
+        self.key_log_widget.config(state=tk.DISABLED)
+
     def log(self, message):
         """Thread-safe log entry point (engine poll threads call this)."""
         self._log_queue.put(str(message))
+
+    def key_log(self, message):
+        """Thread-safe entry point for verbose per-keydown hotkey diagnostics.
+        Routed to the collapsible Key Input Log, never the main log."""
+        self._key_log_queue.put(str(message))
 
     def _drain_log(self):
         """Flush queued log messages on the main thread (Tk is not thread-safe)."""
@@ -700,6 +748,22 @@ class GGModUI:
                 self.log_widget.config(state=tk.DISABLED)
         except queue.Empty:
             pass
+        # Drain the key-input log too, trimming so a flood can't grow unbounded.
+        try:
+            appended = False
+            while True:
+                message = self._key_log_queue.get_nowait()
+                self.key_log_widget.config(state=tk.NORMAL)
+                self.key_log_widget.insert(tk.END, message + "\n")
+                appended = True
+        except queue.Empty:
+            if appended:
+                # Keep only the last ~400 lines.
+                line_count = int(self.key_log_widget.index("end-1c").split(".")[0])
+                if line_count > 400:
+                    self.key_log_widget.delete("1.0", "{}.0".format(line_count - 400))
+                self.key_log_widget.see(tk.END)
+                self.key_log_widget.config(state=tk.DISABLED)
         self.root.after(100, self._drain_log)
 
     # ==================================================================

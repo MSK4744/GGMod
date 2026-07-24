@@ -16,10 +16,14 @@ class HotkeyManager:
     scan codes rather than characters.
     """
 
-    def __init__(self, log_callback=None):
+    def __init__(self, log_callback=None, key_log_callback=None):
         # log_callback(message: str) lets the UI receive our messages
         # without this module knowing anything about tkinter.
         self._log = log_callback if log_callback else (lambda msg: None)
+        # key_log_callback receives the verbose per-keydown diagnostics so the
+        # UI can route them to a separate collapsible panel instead of the main
+        # log. Falls back to the main log if not provided.
+        self._key_log = key_log_callback if key_log_callback else self._log
         # canonical key_name (e.g. "num 1", "f2", "ctrl+num 1") -> callback.
         # NOTE: we do NOT use keyboard.add_hotkey for matching. add_hotkey maps
         # a name to a SET of scan codes that lumps numpad 1 (sc 79) together
@@ -142,7 +146,8 @@ class HotkeyManager:
             callback = self._registered.get(combo)
             matched = callback is not None
             if matched or self.debug:
-                self._log(
+                # Verbose per-keydown diagnostics go to the dedicated key log.
+                self._key_log(
                     "keydown sc={} keypad={} -> '{}' [{}]".format(
                         event.scan_code, getattr(event, "is_keypad", False),
                         combo, "MATCH -> trigger" if matched else "no match"
