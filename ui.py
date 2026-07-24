@@ -538,6 +538,14 @@ class GGModUI:
                  insertbackground=FG, relief=tk.SOLID, bd=1,
                  highlightthickness=1, highlightbackground=BORDER,
                  highlightcolor=ACCENT).pack(side=tk.LEFT)
+        # Auto-fill AOB/register/offset from a live memory address (Cheat Engine).
+        # `entry` is assigned below; the closure resolves it at click time.
+        tk.Button(
+            line1, text="From address…",
+            command=lambda: self._from_address(entry),
+            bg=ACCENT2, fg=WHITE, activebackground=ACCENT, activeforeground=WHITE,
+            relief=tk.FLAT, cursor="hand2", font=(FONT, 8, "bold"), padx=6,
+        ).pack(side=tk.LEFT, padx=(6, 0))
 
         line2 = tk.Frame(row, bg=BG2)
         line2.pack(fill=tk.X, padx=4, pady=(0, 3))
@@ -618,6 +626,113 @@ class GGModUI:
                 "Auto-steal used {}, but this AOB has wildcards in the steal "
                 "region — double-check it disassembled correctly.".format(steal))
         self.log(msg)
+
+    def _from_address(self, entry):
+        """Dialog: read a live address, disassemble, and auto-fill the hook.
+
+        Reuses engine.build_candidate_from_address (capstone + scan_aob). The
+        user reviews the decoded instructions + match count, then fills the
+        AOB / register / struct_offset / module fields (all stay editable)."""
+        self.form_error_var.set("")
+        if not self.engine.is_attached():
+            self.form_error_var.set(
+                "Attach to the game first — 'From address' reads live memory.")
+            return
+
+        top = tk.Toplevel(self.root)
+        top.title("Build hook from address")
+        top.configure(bg=BG)
+        top.transient(self.root)
+        top.grab_set()
+
+        head = tk.Frame(top, bg=BG)
+        head.pack(fill=tk.X, padx=12, pady=(12, 4))
+        self._label(head, "Address (hex, from Cheat Engine):", fg=MUTED).pack(side=tk.LEFT)
+        addr_var = tk.StringVar()
+        addr_entry = self._entry(head, addr_var, width=18)
+        addr_entry.pack(side=tk.LEFT, padx=(6, 6))
+        addr_entry.focus_set()
+
+        result_txt = tk.Text(top, width=64, height=12, bg=BG3, fg=FG, relief=tk.FLAT,
+                             wrap=tk.NONE, font=(MONO, 9), state=tk.DISABLED)
+        result_txt.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
+        result_txt.tag_configure("ok", foreground=GREEN)
+        result_txt.tag_configure("warn", foreground=AMBER)
+        result_txt.tag_configure("err", foreground=RED)
+
+        # Holds the last successful candidate so "Fill fields" can apply it.
+        state = {"candidate": None}
+
+        def _put(text="", tag=None):
+            result_txt.config(state=tk.NORMAL)
+            result_txt.insert(tk.END, text + "\n", (tag,) if tag else ())
+            result_txt.config(state=tk.DISABLED)
+
+        def _read():
+            result_txt.config(state=tk.NORMAL); result_txt.delete("1.0", tk.END)
+            result_txt.config(state=tk.DISABLED)
+            state["candidate"] = None
+            fill_btn.config(state=tk.DISABLED)
+            raw = addr_var.get().strip()
+            try:
+                address = int(raw, 16)   # CE addresses are hex (0x optional)
+            except ValueError:
+                _put("Enter a valid hex address (e.g. 16BBAE38).", "err")
+                return
+            res = self.engine.build_candidate_from_address(address)
+            if "error" in res:
+                _put(res["error"], "err")
+                return
+            m = res.get("matches")
+            mtag = "ok" if m == 1 else "warn"
+            _put("AOB     : {}".format(res["aob"]))
+            _put("matches : {}".format(m), mtag)
+            _put("module  : {}".format(res.get("module") or "main module"))
+            reg, off = res.get("capture_register"), res.get("struct_offset")
+            if reg and off is not None:
+                _put("register: {}    struct_offset: {} (hex)".format(reg, off), "ok")
+            else:
+                _put("register/offset: not auto-filled — {}".format(
+                    res.get("reason", "")), "warn")
+            _put("")
+            _put("decoded instructions:")
+            for ins in res.get("instructions", []):
+                _put("  {}  {:<22} {}".format(
+                    ins["address"], ins["bytes"], ins["text"]))
+            if m != 1:
+                _put("")
+                _put("Not unique yet — you can extend/edit the AOB after filling.",
+                     "warn")
+            state["candidate"] = res
+            fill_btn.config(state=tk.NORMAL)
+
+        def _fill():
+            res = state["candidate"]
+            if not res:
+                return
+            entry["aob"].set(res["aob"])
+            if res.get("capture_register"):
+                entry["register"].set(res["capture_register"])
+            if res.get("module"):
+                entry["module"].set(res["module"])
+            if res.get("struct_offset") is not None:
+                self.form_vars["struct_offset"].set(res["struct_offset"])
+            self.log(
+                "From address: filled AOB ({} match(es)){}{}.".format(
+                    res.get("matches"),
+                    ", reg=" + res["capture_register"] if res.get("capture_register") else "",
+                    ", offset=" + res["struct_offset"] if res.get("struct_offset") is not None else "",
+                ))
+            top.destroy()
+
+        btns = tk.Frame(top, bg=BG)
+        btns.pack(fill=tk.X, padx=12, pady=(0, 12))
+        self._button(head, "Read", _read).pack(side=tk.LEFT)
+        addr_entry.bind("<Return>", lambda _e: _read())
+        fill_btn = self._button(btns, "Fill fields", _fill)
+        fill_btn.pack(side=tk.LEFT)
+        fill_btn.config(state=tk.DISABLED)
+        self._button_ghost(btns, "Cancel", top.destroy).pack(side=tk.LEFT, padx=(6, 0))
 
     def _add_form_row(self, key, label, widget_factory):
         row = tk.Frame(self.form, bg=BG)

@@ -637,6 +637,114 @@ class TrainerEngine:
             raise MidInstructionStealError(steal, lo, hi, bounds)
         return bounds  # steal >= last boundary: beyond decoded AOB, unverifiable
 
+    def _module_for_address(self, address):
+        """Return (module_name_or_None, base, size) for the module containing
+        `address`. module_name is None when it's the main executable module
+        (so callers pass None to scan_aob for the default main-module scan)."""
+        try:
+            main_base = int(self.pm.base_address)
+            for m in self.pm.list_modules():
+                base = int(m.lpBaseOfDll)
+                size = int(m.SizeOfImage)
+                if base <= address < base + size:
+                    return (None if base == main_base else m.name), base, size
+        except Exception:
+            pass
+        return None, 0, 0
+
+    def build_candidate_from_address(self, address, byte_span=32):
+        """Read live bytes at `address`, disassemble, and build a hook candidate
+        for the Add Mod form: a unique AOB plus best-effort register/offset.
+
+        Reuses the existing pieces (capstone via _make_disassembler, uniqueness
+        via scan_aob, hex offsets via the _parse_offset convention). Does NOT
+        compute steal — that stays the 'Auto' button's job (compute_min_steal).
+
+        Returns a dict with aob/matches/module/capture_register/struct_offset/
+        reason/instructions, or {"error": "..."} on failure.
+        """
+        if self.pm is None:
+            return {"error": "Not attached — attach to the game first."}
+        try:
+            address = int(address)
+        except (TypeError, ValueError):
+            return {"error": "Invalid address."}
+        raw = self._read(address, byte_span)
+        if not raw:
+            return {"error": "Could not read {} bytes at {:#x}.".format(
+                byte_span, address)}
+        try:
+            md = self._make_disassembler()
+        except RuntimeError as exc:
+            return {"error": str(exc)}
+        md.detail = True
+        insns = list(md.disasm(bytes(raw), address))
+        if not insns:
+            return {"error": "Could not disassemble bytes at {:#x}.".format(address)}
+
+        # Scan the module that actually contains this address (so a DLL hook
+        # like GameAssembly.dll checks uniqueness in the right module, and the
+        # hook targets it at apply time).
+        module_name, _, _ = self._module_for_address(address)
+
+        # Progressive AOB: start at the first whole instruction, extend by whole
+        # instructions until the pattern is unique (1 match) or a cap is hit.
+        # Adding bytes only narrows matches, so this converges monotonically.
+        CAP_BYTES, CAP_INSNS = 20, 6
+        cum = 0
+        used = 0
+        aob_hex = ""
+        matches = None
+        for i, insn in enumerate(insns):
+            if i >= CAP_INSNS or cum + insn.size > CAP_BYTES:
+                break
+            cum += insn.size
+            used = i + 1
+            aob_hex = " ".join("{:02X}".format(b) for b in raw[:cum])
+            matches = len(self.scan_aob(aob_hex, module_name=module_name))
+            if matches == 1:
+                break
+
+        # Best-effort register/offset from the FIRST instruction's memory operand.
+        first = insns[0]
+        reg = None
+        offset_str = None
+        reason = "ok"
+        mem_ops = [op for op in first.operands if op.type == capstone.CS_OP_MEM]
+        if not mem_ops:
+            reason = "no memory operand — set register/offset manually"
+        elif len(mem_ops) > 1:
+            reason = "multiple memory operands — set register/offset manually"
+        elif mem_ops[0].mem.base == 0:
+            reason = "memory operand has no base register — set manually"
+        else:
+            mem = mem_ops[0].mem
+            reg = first.reg_name(mem.base)
+            disp = mem.disp
+            # Hex string, no 0x prefix, so it round-trips through _parse_offset
+            # (hex-by-convention) exactly like a hand-typed offset.
+            offset_str = "-{:X}".format(-disp) if disp < 0 else "{:X}".format(disp)
+
+        instructions = [
+            {
+                "address": "0x{:X}".format(insn.address),
+                "text": "{} {}".format(insn.mnemonic, insn.op_str).strip(),
+                "bytes": " ".join("{:02X}".format(b) for b in insn.bytes),
+                "size": insn.size,
+            }
+            for insn in (insns[:used] or insns[:1])
+        ]
+
+        return {
+            "aob": aob_hex,
+            "matches": matches,
+            "module": module_name,
+            "capture_register": reg,
+            "struct_offset": offset_str,
+            "reason": reason,
+            "instructions": instructions,
+        }
+
     @staticmethod
     def _mod_hooks(mod):
         """Return a mod's hook list.
