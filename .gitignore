@@ -219,3 +219,6 @@ __marimo__/
 
 # GGMod project-specific
 games/
+
+# Local scan-hotkey bindings (per-machine)
+ggmod_settings.json

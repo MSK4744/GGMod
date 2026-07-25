@@ -53,6 +53,18 @@ if getattr(sys, "frozen", False):
 else:
     _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 GAMES_DIR = os.path.join(_APP_DIR, "games")
+# Small local settings file (scan-hotkey bindings) so they survive a restart.
+SETTINGS_PATH = os.path.join(_APP_DIR, "ggmod_settings.json")
+
+# Value-Scanner global hotkey actions. The action key doubles as the Next Scan
+# scan_type passed to the scanner, so no extra mapping is needed.
+SCAN_HOTKEY_ACTIONS = [
+    ("increased", "Next Scan (Increased)"),
+    ("decreased", "Next Scan (Decreased)"),
+    ("unchanged", "Next Scan (Unchanged)"),
+    ("changed",   "Next Scan (Changed)"),
+]
+SCAN_HOTKEY_LABELS = dict(SCAN_HOTKEY_ACTIONS)
 
 GRIP = "⋮"   # ⋮ three-dot drag handle shown before each mod name
 
@@ -86,6 +98,14 @@ class GGModUI:
         self._key_log_queue = queue.Queue()
         # mod name -> hotkey string currently registered as a global hotkey.
         self._bound = {}
+        # Value-Scanner global hotkeys: action -> key string (user-bound), and
+        # the set of keys currently registered for them (so we unregister only
+        # OUR keys, never a mod's). Loaded from the settings file (root/BoolVar
+        # don't exist yet, so the enabled flag is kept as a plain bool for now).
+        self._scan_bound = {}
+        self._scan_registered = set()
+        self._scan_hotkeys_enabled_pref = False
+        self._load_settings()
         # Note-column tooltip state.
         self._tooltip = None
         self._tip_key = None
@@ -110,6 +130,8 @@ class GGModUI:
         self.refresh_game_list()
         self._drain_log()             # start log pump
         self._refresh_form_fields()   # set initial add-form visibility
+        # Sync scan hotkeys with restored settings (no-op until attached).
+        self._apply_scan_hotkeys()
 
     # ==================================================================
     # Styling
@@ -457,7 +479,67 @@ class GGModUI:
         sb.config(command=self.scan_tree.yview)
         # Double-click a row copies its address to the clipboard.
         self.scan_tree.bind("<Double-1>", self._copy_scan_address)
+
+        # ---- Scan Hotkeys: user-bindable GLOBAL keys for Next Scan ----------
+        hk = tk.Frame(tab, bg=BG)
+        hk.pack(fill=tk.X, padx=8, pady=(2, 8))
+        hkhead = tk.Frame(hk, bg=BG)
+        hkhead.pack(fill=tk.X)
+        self._label(hkhead, "Scan Hotkeys", fg=ACCENT,
+                    font=(FONT, 10, "bold")).pack(side=tk.LEFT)
+        self.scan_hotkeys_enabled = tk.BooleanVar(
+            value=self._scan_hotkeys_enabled_pref)
+        tk.Checkbutton(
+            hkhead, text="Enable (global)", variable=self.scan_hotkeys_enabled,
+            command=self.on_toggle_scan_hotkeys, bg=BG, fg=FG, selectcolor=BG3,
+            activebackground=BG, activeforeground=FG,
+            font=(FONT, 9)).pack(side=tk.LEFT, padx=(10, 0))
+
+        self._scan_key_vars = {}
+        rows = tk.Frame(hk, bg=BG)
+        rows.pack(fill=tk.X, pady=(2, 0))
+        rows.columnconfigure(1, weight=1)
+        for r, (action, label) in enumerate(SCAN_HOTKEY_ACTIONS):
+            self._label(rows, label, fg=MUTED, anchor="w").grid(
+                row=r, column=0, sticky="w", pady=1)
+            var = tk.StringVar(value=self._scan_bound.get(action, "") or "(unset)")
+            self._scan_key_vars[action] = var
+            self._label(rows, "", fg=FG, textvariable=var, anchor="w",
+                        font=(MONO, 9)).grid(row=r, column=1, sticky="w", padx=8)
+            self._button(rows, "Set", lambda a=action: self.on_set_scan_hotkey(a),
+                         ).grid(row=r, column=2, sticky="e", padx=(0, 4), pady=1)
+            self._button_ghost(rows, "Clear",
+                               lambda a=action: self.on_clear_scan_hotkey(a)
+                               ).grid(row=r, column=3, sticky="e", pady=1)
+
         self._sync_scan_value_state()
+
+    # ---- Scan-hotkey settings persistence --------------------------------
+    def _load_settings(self):
+        """Load scan-hotkey bindings + enabled flag from the settings file into
+        self._scan_bound / self._scan_hotkeys_enabled_pref (best-effort)."""
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return
+        raw = data.get("scan_hotkeys", {})
+        if isinstance(raw, dict):
+            # Keep only known actions with a non-empty string key.
+            self._scan_bound = {a: str(raw[a]) for a, _ in SCAN_HOTKEY_ACTIONS
+                                if isinstance(raw.get(a), str) and raw.get(a)}
+        self._scan_hotkeys_enabled_pref = bool(data.get("scan_hotkeys_enabled"))
+
+    def _save_settings(self):
+        try:
+            enabled = bool(self.scan_hotkeys_enabled.get()) \
+                if hasattr(self, "scan_hotkeys_enabled") \
+                else self._scan_hotkeys_enabled_pref
+            with open(SETTINGS_PATH, "w", encoding="utf-8") as fh:
+                json.dump({"scan_hotkeys": self._scan_bound,
+                           "scan_hotkeys_enabled": enabled}, fh, indent=2)
+        except OSError as exc:
+            self.log("Could not save settings: {}".format(exc))
 
     def _sync_scan_value_state(self):
         """Enable the Value field only for scan types that need a target."""
@@ -561,6 +643,102 @@ class GGModUI:
         self.root.clipboard_clear()
         self.root.clipboard_append(address)
         self.scan_status.set("Copied {} to clipboard.".format(address))
+
+    # ---- Scan hotkeys: global, user-bindable, reuse HotkeyManager --------
+    def _scan_key_conflict(self, key, exclude_action=None):
+        """Return a description of what holds `key` across mod AND scan
+        bindings, or None. Keeps mod and scan hotkeys from stealing each
+        other's key (both live in the same HotkeyManager)."""
+        key = (key or "").strip()
+        if not key:
+            return None
+        for name, k in self._bound.items():
+            if k == key:
+                return "mod '{}'".format(name)
+        for action, k in self._scan_bound.items():
+            if action != exclude_action and k == key:
+                return "scan hotkey '{}'".format(SCAN_HOTKEY_LABELS[action])
+        return None
+
+    def on_set_scan_hotkey(self, action):
+        label = SCAN_HOTKEY_LABELS[action]
+        self.scan_status.set(
+            "Press a key (or Ctrl/Shift/Alt combo) for {}…".format(label))
+
+        def _worker():
+            key = self.hotkeys.capture_next_key()
+            self.root.after(0, lambda: self._scan_hotkey_captured(action, key))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _scan_hotkey_captured(self, action, key):
+        label = SCAN_HOTKEY_LABELS[action]
+        conflict = self._scan_key_conflict(key, exclude_action=action)
+        if conflict is not None:
+            self.scan_status.set(
+                "'{}' is already used by {}. Pick a different key.".format(
+                    key, conflict))
+            return
+        self._scan_bound[action] = key
+        self._scan_key_vars[action].set(key)
+        self._save_settings()
+        self._apply_scan_hotkeys()            # (re)register if enabled+attached
+        self.log("Scan hotkey set: {} -> '{}'.".format(label, key))
+        self.scan_status.set("{} bound to '{}'.".format(label, key))
+
+    def on_clear_scan_hotkey(self, action):
+        if self._scan_bound.pop(action, None) is None:
+            return
+        self._scan_key_vars[action].set("(unset)")
+        self._save_settings()
+        self._apply_scan_hotkeys()
+        self.log("Scan hotkey cleared: {}.".format(SCAN_HOTKEY_LABELS[action]))
+
+    def on_toggle_scan_hotkeys(self):
+        self._save_settings()
+        self._apply_scan_hotkeys()
+        if self.scan_hotkeys_enabled.get():
+            if not self.engine.is_attached():
+                self.scan_status.set("Scan hotkeys enabled — they activate once "
+                                     "you attach to a game.")
+            else:
+                self.scan_status.set("Scan hotkeys enabled (global).")
+        else:
+            self.scan_status.set("Scan hotkeys disabled.")
+
+    def _apply_scan_hotkeys(self):
+        """Reconcile scan-hotkey registrations with the current enabled/attach
+        state. Only OUR keys are touched — mod hotkeys are never disturbed."""
+        # Remove whatever WE previously registered (never a mod's key).
+        for key in list(self._scan_registered):
+            if key in self.hotkeys._registered:
+                self.hotkeys.unregister(key)
+        self._scan_registered = set()
+
+        enabled = (hasattr(self, "scan_hotkeys_enabled")
+                   and self.scan_hotkeys_enabled.get())
+        if not enabled or not self.engine.is_attached():
+            return
+        for action, key in self._scan_bound.items():
+            if not key:
+                continue
+            # Never steal a mod's key (collisions are blocked at set-time; this
+            # is a defensive guard for keys loaded from settings/config).
+            holder = next((n for n, k in self._bound.items() if k == key), None)
+            if holder is not None:
+                self.log("Scan hotkey '{}' key '{}' also used by mod '{}'; "
+                         "skipping.".format(SCAN_HOTKEY_LABELS[action], key, holder))
+                continue
+            self.hotkeys.register(key, lambda a=action: self._on_scan_hotkey(a))
+            self._scan_registered.add(key)
+
+    def _on_scan_hotkey(self, action):
+        """Global-hotkey callback (runs on the keyboard hook thread). Fires the
+        same Next Scan the button would, with this action's fixed scan type."""
+        self.log("Scan hotkey: {}.".format(SCAN_HOTKEY_LABELS[action]))
+        # Marshal to the main thread; the async helper does the worker + render.
+        self.root.after(
+            0, lambda: self._run_scan_async(lambda: self.scanner.next_scan(action)))
 
     # ---- Details / Preview tab --------------------------------------
     def _build_details_tab(self):
@@ -1354,19 +1532,22 @@ class GGModUI:
             self.status_var.set("● Not attached")
             self.status_label.config(fg=RED)
         self.refresh_mod_list()
+        self._apply_scan_hotkeys()   # activate scan hotkeys now attached (if on)
 
     def on_detach(self):
         if not self.engine.is_attached():
             return
-        # Detach tears down all mods in the engine. Hotkey bindings are
+        # Detach tears down all mods in the engine. Mod hotkey bindings are
         # config-scoped (registered at load), so we KEEP them: a press while
-        # detached is safely ignored, and they work again on re-attach. They
-        # are cleared only on config reload or app close.
+        # detached is safely ignored, and they work again on re-attach. Scan
+        # hotkeys, however, need a live process, so we unregister them here and
+        # re-register on re-attach (see _apply_scan_hotkeys).
         self.engine.detach()
         self.status_var.set("● Not attached")
         self.status_label.config(fg=RED)
         self.preview_ready_for = None
         self.refresh_mod_list()
+        self._apply_scan_hotkeys()   # attached now False -> unregisters scan keys
 
     def update_status(self):
         if self.engine.is_attached():
@@ -1855,6 +2036,18 @@ class GGModUI:
             )
             self.hotkey_btn.config(state=tk.NORMAL)
             return
+        # Also refuse if a Value-Scanner hotkey holds this key (both systems
+        # share one HotkeyManager; don't let them steal each other's key).
+        scan_owner = next(
+            (SCAN_HOTKEY_LABELS[a] for a, k in self._scan_bound.items() if k == key),
+            None)
+        if scan_owner is not None:
+            self.log(
+                "Hotkey conflict: '{}' is already used by scan hotkey '{}'. "
+                "Pick a different key.".format(key, scan_owner)
+            )
+            self.hotkey_btn.config(state=tk.NORMAL)
+            return
         # Remove the stale binding on the OLD key before saving the new one, so
         # _bound never holds duplicate keys pointing at different mods.
         self._unregister_mod_hotkey(name)
@@ -1898,8 +2091,12 @@ class GGModUI:
         deterministically by list order: the FIRST mod to claim a key wins;
         later mods with the same key are skipped (not registered, not added to
         _bound) and left as-is in the JSON for the user to reassign."""
+        # unregister_all() tears down the shared hook and EVERY registration,
+        # including our scan hotkeys, so forget which scan keys were live and
+        # re-apply them after the mod bindings below.
         self.hotkeys.unregister_all()
         self._bound.clear()
+        self._scan_registered = set()
         claimed = {}  # key -> name of the mod that first claimed it this pass
         for mod in self.engine.mods:
             key = (mod.get("hotkey") or "").strip()
@@ -1913,6 +2110,8 @@ class GGModUI:
                 continue
             self._register_mod_hotkey(mod)
             claimed[key] = mod.get("name")
+        # Re-register scan hotkeys on top (mods take priority for a shared key).
+        self._apply_scan_hotkeys()
 
     def _register_mod_hotkey(self, mod):
         name = mod.get("name")
