@@ -118,7 +118,11 @@ class GGModUI:
         self._set_window_icon()
         self.root.configure(bg=BG)
         self.root.geometry("1040x720")
-        self.root.minsize(900, 600)
+        # Floor is set just above the top bar's natural width (~826px) so the
+        # window genuinely shrinks from the old 900x600 without clipping the
+        # Attach/New Game row. The main area (fixed 460 right panel + mod list)
+        # squeezes gracefully because every panel uses fill/expand.
+        self.root.minsize(880, 500)
 
         self._resolve_font()
         self._setup_style()
@@ -401,10 +405,14 @@ class GGModUI:
     ]
     _SCAN_TYPES_NEED_VALUE = {"exact", "increased_by", "decreased_by"}
 
+    # Fixed-ish width of the right-hand controls column in the scanner tab.
+    _SCAN_CTRL_WIDTH = 250
+
     def _build_scanner_tab(self):
         tab = tk.Frame(self.notebook, bg=BG)
         self.notebook.add(tab, text="Value Scanner")
 
+        # --- Header row (title + full-window toggle) ---------------------
         header = tk.Frame(tab, bg=BG)
         header.pack(fill=tk.X, padx=8, pady=(8, 2))
         self._label(header, "Memory Value Scanner", fg=ACCENT,
@@ -414,90 +422,83 @@ class GGModUI:
         self._fullwin_btn = self._button_ghost(
             header, "⤢ Full window", self._toggle_scanner_fullwindow)
         self._fullwin_btn.pack(side=tk.RIGHT)
-        self._label(tab, "Find an address by value (read-only). Copy the address "
-                    "into Add Mod → From address…", fg=MUTED, font=(FONT, 8),
-                    wraplength=430, justify="left").pack(anchor="w", padx=8)
 
-        # Controls: one per row, label in col 0, control stretches in col 1 so
-        # nothing overflows the fixed-width panel regardless of text length.
-        ctl = tk.Frame(tab, bg=BG)
-        ctl.pack(fill=tk.X, padx=8, pady=6)
+        # --- Body: results table (LEFT, expands) + controls (RIGHT, fixed) --
+        # Cheat-Engine arrangement: the results list dominates, controls sit in
+        # a narrow column on the right. Everything below uses fill/expand so the
+        # table grows and shrinks with the window instead of staying static.
+        body = tk.Frame(tab, bg=BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 8))
+
+        # ---- RIGHT: controls column (packed first so it keeps its width when
+        # the window shrinks; the table then absorbs whatever is left). ----
+        controls = tk.Frame(body, bg=BG, width=self._SCAN_CTRL_WIDTH)
+        controls.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
+        controls.pack_propagate(False)   # honour the fixed column width
+
+        ctl = tk.Frame(controls, bg=BG)
+        ctl.pack(fill=tk.X, pady=(0, 6))
         ctl.columnconfigure(1, weight=1)
 
         def _ctl_label(r, text):
-            self._label(ctl, text, fg=MUTED, width=11, anchor="w").grid(
+            self._label(ctl, text, fg=MUTED, width=10, anchor="w").grid(
                 row=r, column=0, sticky="w", pady=3)
 
         _ctl_label(0, "Value type:")
         self.scan_vtype = tk.StringVar(value=self._SCAN_VALUE_TYPE_LABELS[0][0])
         ttk.Combobox(ctl, textvariable=self.scan_vtype, state="readonly",
+                     width=10,
                      values=[lbl for lbl, _ in self._SCAN_VALUE_TYPE_LABELS]
                      ).grid(row=0, column=1, sticky="ew")
 
         _ctl_label(1, "Scan type:")
         self.scan_stype = tk.StringVar(value=self._SCAN_TYPE_LABELS[0][0])
         stype_combo = ttk.Combobox(
-            ctl, textvariable=self.scan_stype, state="readonly",
+            ctl, textvariable=self.scan_stype, state="readonly", width=10,
             values=[lbl for lbl, _ in self._SCAN_TYPE_LABELS])
         stype_combo.grid(row=1, column=1, sticky="ew")
         stype_combo.bind("<<ComboboxSelected>>", lambda _e: self._sync_scan_value_state())
 
         _ctl_label(2, "Value:")
         self.scan_value = tk.StringVar()
-        self.scan_value_entry = self._entry(ctl, self.scan_value, width=18)
+        self.scan_value_entry = self._entry(ctl, self.scan_value, width=12)
         self.scan_value_entry.grid(row=2, column=1, sticky="ew")
 
         _ctl_label(3, "Region:")
         self.scan_region = tk.StringVar(value="All")
         self.scan_region_combo = ttk.Combobox(
-            ctl, textvariable=self.scan_region, values=["All", "main exe"])
+            ctl, textvariable=self.scan_region, width=10,
+            values=["All", "main exe"])
         self.scan_region_combo.grid(row=3, column=1, sticky="ew")
 
-        # Buttons: scan controls on row 1, live-refresh on row 2 (so the long
-        # "Refresh values" label isn't clipped against the panel edge).
-        btns = tk.Frame(tab, bg=BG)
-        btns.pack(fill=tk.X, padx=8, pady=(2, 2))
+        # Scan buttons: 2-column grid so the labels never clip in the narrow
+        # column and each cell stretches evenly (sticky="ew" + equal weights).
+        btns = tk.Frame(controls, bg=BG)
+        btns.pack(fill=tk.X, pady=(2, 2))
+        btns.columnconfigure(0, weight=1)
+        btns.columnconfigure(1, weight=1)
         self.scan_first_btn = self._button(btns, "First Scan", self.on_first_scan)
-        self.scan_first_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self.scan_first_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3), pady=2)
         self.scan_next_btn = self._button(btns, "Next Scan", self.on_next_scan)
-        self.scan_next_btn.pack(side=tk.LEFT, padx=4)
-        self._button_ghost(btns, "Undo Scan", self.on_undo_scan).pack(side=tk.LEFT, padx=4)
-        self._button_ghost(btns, "New Scan", self.on_new_scan).pack(side=tk.LEFT, padx=4)
-
-        btns2 = tk.Frame(tab, bg=BG)
-        btns2.pack(fill=tk.X, padx=8, pady=(0, 4))
-        self._button_ghost(btns2, "Refresh values", self.on_refresh_values).pack(side=tk.LEFT)
-        self._button_ghost(btns2, "Copy selected address",
-                           self._copy_scan_address).pack(side=tk.LEFT, padx=(6, 0))
+        self.scan_next_btn.grid(row=0, column=1, sticky="ew", padx=(3, 0), pady=2)
+        self._button_ghost(btns, "Undo Scan", self.on_undo_scan).grid(
+            row=1, column=0, sticky="ew", padx=(0, 3), pady=2)
+        self._button_ghost(btns, "New Scan", self.on_new_scan).grid(
+            row=1, column=1, sticky="ew", padx=(3, 0), pady=2)
+        self._button_ghost(btns, "Refresh values", self.on_refresh_values).grid(
+            row=2, column=0, columnspan=2, sticky="ew", pady=2)
+        self._button_ghost(btns, "Copy selected address",
+                           self._copy_scan_address).grid(
+            row=3, column=0, columnspan=2, sticky="ew", pady=2)
 
         self.scan_status = tk.StringVar(value="Not scanned yet.")
-        self._label(tab, "", fg=MUTED, textvariable=self.scan_status,
-                    wraplength=430, justify="left").pack(anchor="w", padx=8)
-
-        # Results list
-        list_frame = tk.Frame(tab, bg=BG)
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 8))
-        sb = tk.Scrollbar(list_frame)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.scan_tree = ttk.Treeview(
-            list_frame, columns=("value", "previous", "module"),
-            show="tree headings", height=12, yscrollcommand=sb.set)
-        self.scan_tree.heading("#0", text="Address")
-        self.scan_tree.column("#0", width=140, minwidth=110, anchor="w")
-        self.scan_tree.heading("value", text="Value")
-        self.scan_tree.column("value", width=100, minwidth=60, anchor="w")
-        self.scan_tree.heading("previous", text="Previous")
-        self.scan_tree.column("previous", width=100, minwidth=60, anchor="w")
-        self.scan_tree.heading("module", text="Module")
-        self.scan_tree.column("module", width=110, minwidth=60, anchor="w")
-        self.scan_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sb.config(command=self.scan_tree.yview)
-        # Double-click a row copies its address to the clipboard.
-        self.scan_tree.bind("<Double-1>", self._copy_scan_address)
+        self._label(controls, "", fg=MUTED, textvariable=self.scan_status,
+                    wraplength=self._SCAN_CTRL_WIDTH - 8, justify="left"
+                    ).pack(anchor="w", pady=(4, 2))
 
         # ---- Scan Hotkeys: user-bindable GLOBAL keys for Next Scan ----------
-        hk = tk.Frame(tab, bg=BG)
-        hk.pack(fill=tk.X, padx=8, pady=(2, 8))
+        hk = tk.Frame(controls, bg=BG)
+        hk.pack(fill=tk.X, pady=(6, 0))
         hkhead = tk.Frame(hk, bg=BG)
         hkhead.pack(fill=tk.X)
         self._label(hkhead, "Scan Hotkeys", fg=ACCENT,
@@ -505,27 +506,61 @@ class GGModUI:
         self.scan_hotkeys_enabled = tk.BooleanVar(
             value=self._scan_hotkeys_enabled_pref)
         tk.Checkbutton(
-            hkhead, text="Enable (global)", variable=self.scan_hotkeys_enabled,
+            hkhead, text="Global", variable=self.scan_hotkeys_enabled,
             command=self.on_toggle_scan_hotkeys, bg=BG, fg=FG, selectcolor=BG3,
             activebackground=BG, activeforeground=FG,
-            font=(FONT, 9)).pack(side=tk.LEFT, padx=(10, 0))
+            font=(FONT, 9)).pack(side=tk.LEFT, padx=(8, 0))
 
         self._scan_key_vars = {}
         rows = tk.Frame(hk, bg=BG)
         rows.pack(fill=tk.X, pady=(2, 0))
-        rows.columnconfigure(1, weight=1)
+        rows.columnconfigure(0, weight=1)
+        # Each action gets its own row: label + current key on the top line,
+        # Set/Clear buttons below, so nothing spills past the narrow column.
         for r, (action, label) in enumerate(SCAN_HOTKEY_ACTIONS):
-            self._label(rows, label, fg=MUTED, anchor="w").grid(
-                row=r, column=0, sticky="w", pady=1)
+            block = tk.Frame(rows, bg=BG)
+            block.grid(row=r, column=0, sticky="ew", pady=(2, 0))
+            block.columnconfigure(1, weight=1)
+            self._label(block, label, fg=MUTED, anchor="w").grid(
+                row=0, column=0, sticky="w")
             var = tk.StringVar(value=self._scan_bound.get(action, "") or "(unset)")
             self._scan_key_vars[action] = var
-            self._label(rows, "", fg=FG, textvariable=var, anchor="w",
-                        font=(MONO, 9)).grid(row=r, column=1, sticky="w", padx=8)
-            self._button(rows, "Set", lambda a=action: self.on_set_scan_hotkey(a),
-                         ).grid(row=r, column=2, sticky="e", padx=(0, 4), pady=1)
-            self._button_ghost(rows, "Clear",
-                               lambda a=action: self.on_clear_scan_hotkey(a)
-                               ).grid(row=r, column=3, sticky="e", pady=1)
+            self._label(block, "", fg=FG, textvariable=var, anchor="e",
+                        font=(MONO, 9)).grid(row=0, column=1, sticky="e", padx=6)
+            self._button(block, "Set",
+                         lambda a=action: self.on_set_scan_hotkey(a)).grid(
+                row=0, column=2, sticky="e", padx=(0, 3))
+            self._button_ghost(block, "Clear",
+                               lambda a=action: self.on_clear_scan_hotkey(a)).grid(
+                row=0, column=3, sticky="e")
+
+        # ---- LEFT: results table (fills all remaining space) ---------------
+        results = tk.Frame(body, bg=BG)
+        results.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._label(results, "Find an address by value (read-only). Double-click "
+                    "or Copy an address into Add Mod → From address…", fg=MUTED,
+                    font=(FONT, 8), wraplength=360, justify="left",
+                    anchor="w").pack(fill=tk.X, pady=(0, 4))
+
+        list_frame = tk.Frame(results, bg=BG)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+        sb = tk.Scrollbar(list_frame)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.scan_tree = ttk.Treeview(
+            list_frame, columns=("value", "previous", "module"),
+            show="tree headings", height=12, yscrollcommand=sb.set)
+        self.scan_tree.heading("#0", text="Address")
+        self.scan_tree.column("#0", width=150, minwidth=110, anchor="w")
+        self.scan_tree.heading("value", text="Value")
+        self.scan_tree.column("value", width=110, minwidth=60, anchor="w")
+        self.scan_tree.heading("previous", text="Previous")
+        self.scan_tree.column("previous", width=110, minwidth=60, anchor="w")
+        self.scan_tree.heading("module", text="Module")
+        self.scan_tree.column("module", width=120, minwidth=60, anchor="w")
+        self.scan_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.config(command=self.scan_tree.yview)
+        # Double-click a row copies its address to the clipboard.
+        self.scan_tree.bind("<Double-1>", self._copy_scan_address)
 
         self._sync_scan_value_state()
 
