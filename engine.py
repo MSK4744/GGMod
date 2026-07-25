@@ -43,9 +43,33 @@ _kernel32.VirtualProtectEx.argtypes = [
     ctypes.POINTER(wintypes.DWORD),
 ]
 
+
+class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+    """Layout matches the Win32 struct; ctypes inserts natural alignment
+    padding (so RegionSize lands at offset 24 on 64-bit)."""
+    _fields_ = [
+        ("BaseAddress", ctypes.c_void_p),
+        ("AllocationBase", ctypes.c_void_p),
+        ("AllocationProtect", wintypes.DWORD),
+        ("RegionSize", ctypes.c_size_t),
+        ("State", wintypes.DWORD),
+        ("Protect", wintypes.DWORD),
+        ("Type", wintypes.DWORD),
+    ]
+
+
+_kernel32.VirtualQueryEx.restype = ctypes.c_size_t
+_kernel32.VirtualQueryEx.argtypes = [
+    wintypes.HANDLE, wintypes.LPCVOID,
+    ctypes.POINTER(MEMORY_BASIC_INFORMATION), ctypes.c_size_t,
+]
+
 MEM_COMMIT = 0x1000
 MEM_RESERVE = 0x2000
 PAGE_EXECUTE_READWRITE = 0x40
+# Page protections that make a committed region unreadable for scanning.
+PAGE_NOACCESS = 0x01
+PAGE_GUARD = 0x100
 
 # Cave layout: first bytes are the "shared slot" the cave writes the captured
 # pointer into; code starts further in (aligned) so we never overlap the slot.
@@ -1602,3 +1626,332 @@ class TrainerEngine:
     def is_mod_active(self, mod_name):
         """True if the named mod currently has a live patch/poll thread."""
         return mod_name in self._active
+
+
+# ===========================================================================
+# In-app memory value scanner (Part A) -- a Cheat-Engine-style find tool.
+# Separate from the AOB/hook scanning above; reuses TrainerEngine's memory
+# helpers (_read, pm, _is64, module resolution) rather than duplicating them.
+# ===========================================================================
+
+# Value Type table mirrors CE's dropdown. Ints are signed (CE's default).
+_SCAN_VALUE_TYPES = {
+    "1 byte":  ("<b", 1),
+    "2 bytes": ("<h", 2),
+    "4 bytes": ("<i", 4),
+    "8 bytes": ("<q", 8),
+    "float":   ("<f", 4),
+    "double":  ("<d", 8),
+    "aob":     (None, None),   # array of bytes (hex pattern, wildcards allowed)
+}
+
+# Scan types (Next Scan). First Scan accepts only "exact" or "unknown".
+_SCAN_TYPES_NUMERIC = (
+    "exact", "increased", "decreased", "changed", "unchanged",
+    "increased_by", "decreased_by",
+)
+_SCAN_TYPES_AOB = ("exact", "changed", "unchanged")
+
+
+class MemoryScanner:
+    """Cheat-Engine-style value scanner over a live process.
+
+    Holds candidate addresses + their last-seen values and supports First Scan,
+    Next Scan (with CE's scan-type semantics), one-level Undo, and a live value
+    refresh. Read/find only -- it never writes to the target.
+    """
+
+    MAX_COLLECT = 100000     # cap first-scan collection (bounds memory + time)
+    PREVIEW_LIMIT = 200      # rows returned for display
+    _CHUNK = 0x100000        # 1 MB read window
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.value_type = "4 bytes"
+        self.region = "All"
+        self.results = []        # list of (address, value)
+        self._history = []       # stack of prior result lists (undo)
+        self._module_map = []    # [(base, end, name)] for the Module column
+
+    # ---- value (de)coding -------------------------------------------------
+    def _fmt(self, value_type=None):
+        return _SCAN_VALUE_TYPES[value_type or self.value_type]
+
+    def _decode(self, raw, value_type=None):
+        fmt, size = self._fmt(value_type)
+        if fmt is None:
+            return bytes(raw) if raw else None
+        if raw is None or len(raw) < size:
+            return None
+        try:
+            return struct.unpack(fmt, raw[:size])[0]
+        except struct.error:
+            return None
+
+    def _parse_scalar(self, value, value_type=None):
+        """Parse a target scalar for a numeric type (hex or decimal)."""
+        fmt, _size = self._fmt(value_type)
+        if fmt in ("<f", "<d"):
+            return float(value)
+        if isinstance(value, int):
+            return value
+        return int(str(value), 0)   # accepts 0x.. and decimal
+
+    # ---- region enumeration ----------------------------------------------
+    def _regions(self, region):
+        """Yield (base, size) ranges to scan. region: 'All' -> every committed
+        readable page; 'main' -> main module; otherwise a named module."""
+        eng = self.engine
+        if region in (None, "All", "all"):
+            yield from self._iter_committed()
+        elif region in ("main", "main exe", "Main"):
+            base, size = eng._main_module_range(None)
+            if size:
+                yield base, size
+        else:
+            base, size = eng._main_module_range(region)
+            if size:
+                yield base, size
+
+    def _iter_committed(self):
+        """Walk the address space via VirtualQueryEx, yielding committed,
+        readable (non-guard/non-noaccess) regions."""
+        handle = self.engine.pm.process_handle
+        max_addr = 0x7FFFFFFFFFFF if self.engine._is64 else 0x7FFFFFFF
+        addr = 0
+        mbi = MEMORY_BASIC_INFORMATION()
+        while addr < max_addr:
+            if not _kernel32.VirtualQueryEx(
+                    handle, ctypes.c_void_p(addr),
+                    ctypes.byref(mbi), ctypes.sizeof(mbi)):
+                break
+            base = mbi.BaseAddress or 0
+            size = mbi.RegionSize or 0
+            if size == 0:
+                break
+            prot = mbi.Protect
+            if (mbi.State == MEM_COMMIT and prot not in (0, PAGE_NOACCESS)
+                    and not (prot & PAGE_GUARD)):
+                yield base, size
+            addr = base + size
+
+    def _read_chunks(self, base, size, overlap):
+        """Yield (chunk_bytes, chunk_offset) covering [base, base+size), reading
+        in 1 MB windows with `overlap` extra bytes so a value straddling a
+        window boundary is still found."""
+        off = 0
+        while off < size:
+            rlen = min(self._CHUNK + overlap, size - off)
+            data = self.engine._read(base + off, rlen)
+            if data:
+                yield data, off
+            off += self._CHUNK
+
+    # ---- module column ----------------------------------------------------
+    def _build_module_map(self):
+        self._module_map = []
+        try:
+            for m in self.engine.pm.list_modules():
+                b = int(m.lpBaseOfDll)
+                self._module_map.append((b, b + int(m.SizeOfImage), m.name))
+        except Exception:
+            pass
+        self._module_map.sort()
+
+    def _module_at(self, addr):
+        for b, e, name in self._module_map:
+            if b <= addr < e:
+                return name
+        return ""
+
+    # ---- result formatting ------------------------------------------------
+    def _fmt_value(self, value):
+        if value is None:
+            return "?"
+        if isinstance(value, (bytes, bytearray)):
+            return value.hex(" ").upper()
+        if isinstance(value, float):
+            return repr(value)
+        return str(value)
+
+    def _row(self, addr, value):
+        return {"address": "0x{:X}".format(addr), "address_int": addr,
+                "value": self._fmt_value(value), "module": self._module_at(addr)}
+
+    def _summary(self, truncated=False):
+        return {
+            "count": len(self.results),
+            "results": [self._row(a, v) for a, v in self.results[:self.PREVIEW_LIMIT]],
+            "truncated": bool(truncated) or len(self.results) > self.PREVIEW_LIMIT,
+        }
+
+    # ---- scans ------------------------------------------------------------
+    def new_scan(self):
+        self.results = []
+        self._history = []
+        return self._summary()
+
+    def first_scan(self, value_type, scan_type, value=None, region="All"):
+        if not self.engine.is_attached():
+            return {"error": "Not attached -- attach to the game first."}
+        if value_type not in _SCAN_VALUE_TYPES:
+            return {"error": "Unknown value type: {}".format(value_type)}
+        self.value_type = value_type
+        self.region = region
+        self._history = []
+        self._build_module_map()
+
+        if scan_type == "unknown":
+            return self._first_unknown(region)
+        if scan_type != "exact":
+            return {"error": "First scan supports only Exact Value or Unknown "
+                             "Initial Value."}
+        try:
+            return self._first_exact(value_type, value, region)
+        except (ValueError, struct.error) as ex:
+            return {"error": "Invalid value: {}".format(ex)}
+
+    def _first_exact(self, value_type, value, region):
+        fmt, size = self._fmt(value_type)
+        results = []
+        truncated = False
+        if fmt is None:                         # AOB pattern scan
+            pattern, mask = TrainerEngine._parse_aob(value or "")
+            plen = len(pattern)
+            if plen == 0:
+                return {"error": "Empty AOB pattern."}
+            first_fixed = next((i for i, m in enumerate(mask) if m), 0)
+            first_byte = pattern[first_fixed]
+            for base, rsize in self._regions(region):
+                for chunk, coff in self._read_chunks(base, rsize, plen - 1):
+                    pos = 0
+                    while True:
+                        idx = chunk.find(first_byte, pos)
+                        if idx < 0 or idx + plen > len(chunk):
+                            break
+                        start = idx - first_fixed
+                        if start >= 0 and TrainerEngine._match_at(
+                                chunk, start, pattern, mask):
+                            results.append((base + coff + start,
+                                            bytes(chunk[start:start + plen])))
+                            if len(results) >= self.MAX_COLLECT:
+                                truncated = True
+                                break
+                        pos = idx + 1
+                    if truncated:
+                        break
+                if truncated:
+                    break
+        else:                                   # numeric exact scan
+            v = self._parse_scalar(value, value_type)
+            needle = struct.pack(fmt, v)
+            for base, rsize in self._regions(region):
+                for chunk, coff in self._read_chunks(base, rsize, size - 1):
+                    pos = 0
+                    while True:
+                        idx = chunk.find(needle, pos)
+                        if idx < 0:
+                            break
+                        results.append((base + coff + idx, v))
+                        if len(results) >= self.MAX_COLLECT:
+                            truncated = True
+                            break
+                        pos = idx + 1
+                    if truncated:
+                        break
+                if truncated:
+                    break
+        self.results = results
+        return self._summary(truncated)
+
+    def _first_unknown(self, region):
+        fmt, size = self._fmt()
+        if fmt is None:
+            return {"error": "Unknown Initial Value is not supported for AOB."}
+        results = []
+        truncated = False
+        for base, rsize in self._regions(region):
+            for chunk, coff in self._read_chunks(base, rsize, 0):
+                n = len(chunk) - (len(chunk) % size)
+                for o in range(0, n, size):
+                    val = struct.unpack(fmt, chunk[o:o + size])[0]
+                    results.append((base + coff + o, val))
+                    if len(results) >= self.MAX_COLLECT:
+                        truncated = True
+                        break
+                if truncated:
+                    break
+            if truncated:
+                break
+        self.results = results
+        return self._summary(truncated)
+
+    def next_scan(self, scan_type, value=None):
+        if not self.engine.is_attached():
+            return {"error": "Not attached -- attach to the game first."}
+        fmt, size = self._fmt()
+        valid = _SCAN_TYPES_AOB if fmt is None else _SCAN_TYPES_NUMERIC
+        if scan_type not in valid:
+            return {"error": "Scan type '{}' not valid for {}.".format(
+                scan_type, self.value_type)}
+        target = None
+        try:
+            if scan_type == "exact":
+                if fmt is None:
+                    pattern, _mask = TrainerEngine._parse_aob(value or "")
+                    target = bytes(pattern)
+                else:
+                    target = self._parse_scalar(value)
+            elif scan_type in ("increased_by", "decreased_by"):
+                target = self._parse_scalar(value)
+        except (ValueError, struct.error) as ex:
+            return {"error": "Invalid value: {}".format(ex)}
+
+        self._history.append(list(self.results))   # snapshot for undo
+        new = []
+        for addr, prev in self.results:
+            cur = self._decode(self.engine._read(addr, size))
+            if cur is None:
+                continue                            # unreadable now -> drop
+            if self._compare(scan_type, cur, prev, target):
+                new.append((addr, cur))
+        self.results = new
+        return self._summary()
+
+    @staticmethod
+    def _compare(scan_type, cur, prev, target):
+        if scan_type == "exact":
+            return cur == target
+        if scan_type == "changed":
+            return cur != prev
+        if scan_type == "unchanged":
+            return cur == prev
+        if scan_type == "increased":
+            return cur > prev
+        if scan_type == "decreased":
+            return cur < prev
+        if scan_type == "increased_by":
+            return cur == prev + target
+        if scan_type == "decreased_by":
+            return cur == prev - target
+        return False
+
+    def undo(self):
+        if not self._history:
+            return {"error": "Nothing to undo."}
+        self.results = self._history.pop()
+        return self._summary()
+
+    def refresh_values(self, limit=None):
+        """Re-read the CURRENT value of each displayed candidate WITHOUT
+        filtering (live view). Does not alter the candidate set."""
+        if not self.engine.is_attached():
+            return {"error": "Not attached -- attach to the game first."}
+        limit = limit or self.PREVIEW_LIMIT
+        fmt, size = self._fmt()
+        rows = []
+        for addr, _prev in self.results[:limit]:
+            cur = self._decode(self.engine._read(addr, size))
+            rows.append(self._row(addr, cur))
+        return {"count": len(self.results), "results": rows,
+                "truncated": len(self.results) > limit}

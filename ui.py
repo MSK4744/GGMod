@@ -18,6 +18,7 @@ import sys
 import threading
 
 import engine  # for the capstone-backed steal exceptions (Insufficient/Mid)
+from engine import MemoryScanner
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 
@@ -71,6 +72,8 @@ class GGModUI:
     def __init__(self, engine, hotkeys):
         self.engine = engine
         self.hotkeys = hotkeys
+        # In-app value scanner (CE-style find tool); read/find only.
+        self.scanner = MemoryScanner(engine)
 
         self.config_path = None       # path to the loaded JSON
         self.config_raw = {}          # full parsed config (so we can re-save)
@@ -354,6 +357,206 @@ class GGModUI:
 
         self._build_details_tab()
         self._build_add_tab()
+        self._build_scanner_tab()
+
+    # ---- Value Scanner tab (CE-style find tool) ---------------------
+    _SCAN_VALUE_TYPE_LABELS = [
+        ("4 Bytes", "4 bytes"), ("2 Bytes", "2 bytes"), ("1 Byte", "1 byte"),
+        ("8 Bytes", "8 bytes"), ("Float", "float"), ("Double", "double"),
+        ("Array of Bytes", "aob"),
+    ]
+    _SCAN_TYPE_LABELS = [
+        ("Exact Value", "exact"), ("Unknown Initial Value", "unknown"),
+        ("Increased", "increased"), ("Decreased", "decreased"),
+        ("Changed", "changed"), ("Unchanged", "unchanged"),
+        ("Increased By", "increased_by"), ("Decreased By", "decreased_by"),
+    ]
+    _SCAN_TYPES_NEED_VALUE = {"exact", "increased_by", "decreased_by"}
+
+    def _build_scanner_tab(self):
+        tab = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(tab, text="Value Scanner")
+
+        self._label(tab, "Memory Value Scanner", fg=ACCENT,
+                    font=(FONT, 11, "bold")).pack(anchor="w", padx=8, pady=(8, 2))
+        self._label(tab, "Find an address by value (read-only). Copy the address "
+                    "into Add Mod → From address…", fg=MUTED,
+                    font=(FONT, 8)).pack(anchor="w", padx=8)
+
+        ctl = tk.Frame(tab, bg=BG)
+        ctl.pack(fill=tk.X, padx=8, pady=6)
+
+        # Row 1: value type + scan type
+        self._label(ctl, "Value type:", fg=MUTED, width=11, anchor="w").grid(
+            row=0, column=0, sticky="w", pady=2)
+        self.scan_vtype = tk.StringVar(value=self._SCAN_VALUE_TYPE_LABELS[0][0])
+        ttk.Combobox(ctl, textvariable=self.scan_vtype, state="readonly", width=16,
+                     values=[lbl for lbl, _ in self._SCAN_VALUE_TYPE_LABELS]
+                     ).grid(row=0, column=1, sticky="w")
+        self._label(ctl, "Scan type:", fg=MUTED, width=10, anchor="w").grid(
+            row=0, column=2, sticky="w", padx=(10, 0))
+        self.scan_stype = tk.StringVar(value=self._SCAN_TYPE_LABELS[0][0])
+        stype_combo = ttk.Combobox(
+            ctl, textvariable=self.scan_stype, state="readonly", width=20,
+            values=[lbl for lbl, _ in self._SCAN_TYPE_LABELS])
+        stype_combo.grid(row=0, column=3, sticky="w")
+        stype_combo.bind("<<ComboboxSelected>>", lambda _e: self._sync_scan_value_state())
+
+        # Row 2: value + region
+        self._label(ctl, "Value:", fg=MUTED, width=11, anchor="w").grid(
+            row=1, column=0, sticky="w", pady=2)
+        self.scan_value = tk.StringVar()
+        self.scan_value_entry = self._entry(ctl, self.scan_value, width=18)
+        self.scan_value_entry.grid(row=1, column=1, sticky="w")
+        self._label(ctl, "Region:", fg=MUTED, width=10, anchor="w").grid(
+            row=1, column=2, sticky="w", padx=(10, 0))
+        self.scan_region = tk.StringVar(value="All")
+        self.scan_region_combo = ttk.Combobox(
+            ctl, textvariable=self.scan_region, width=20,
+            values=["All", "main exe"])
+        self.scan_region_combo.grid(row=1, column=3, sticky="w")
+
+        # Buttons (CE-style)
+        btns = tk.Frame(tab, bg=BG)
+        btns.pack(fill=tk.X, padx=8, pady=(2, 4))
+        self.scan_first_btn = self._button(btns, "First Scan", self.on_first_scan)
+        self.scan_first_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self.scan_next_btn = self._button(btns, "Next Scan", self.on_next_scan)
+        self.scan_next_btn.pack(side=tk.LEFT, padx=4)
+        self._button_ghost(btns, "Undo Scan", self.on_undo_scan).pack(side=tk.LEFT, padx=4)
+        self._button_ghost(btns, "New Scan", self.on_new_scan).pack(side=tk.LEFT, padx=4)
+        self._button_ghost(btns, "Refresh values", self.on_refresh_values).pack(
+            side=tk.RIGHT)
+
+        self.scan_status = tk.StringVar(value="Not scanned yet.")
+        self._label(tab, "", fg=MUTED, textvariable=self.scan_status,
+                    wraplength=410, justify="left").pack(anchor="w", padx=8)
+
+        # Results list
+        list_frame = tk.Frame(tab, bg=BG)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 6))
+        sb = tk.Scrollbar(list_frame)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.scan_tree = ttk.Treeview(
+            list_frame, columns=("value", "module"), show="tree headings",
+            height=12, yscrollcommand=sb.set)
+        self.scan_tree.heading("#0", text="Address")
+        self.scan_tree.column("#0", width=150, anchor="w")
+        self.scan_tree.heading("value", text="Value")
+        self.scan_tree.column("value", width=120, anchor="w")
+        self.scan_tree.heading("module", text="Module")
+        self.scan_tree.column("module", width=120, anchor="w")
+        self.scan_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.config(command=self.scan_tree.yview)
+        # Double-click a row copies its address to the clipboard.
+        self.scan_tree.bind("<Double-1>", self._copy_scan_address)
+
+        self._button_ghost(tab, "Copy selected address",
+                           self._copy_scan_address).pack(anchor="w", padx=8, pady=(0, 8))
+        self._sync_scan_value_state()
+
+    def _sync_scan_value_state(self):
+        """Enable the Value field only for scan types that need a target."""
+        key = dict(self._SCAN_TYPE_LABELS).get(self.scan_stype.get(), "exact")
+        need = key in self._SCAN_TYPES_NEED_VALUE
+        self.scan_value_entry.config(state=tk.NORMAL if need else tk.DISABLED)
+
+    def _scan_selected_keys(self):
+        vtype = dict(self._SCAN_VALUE_TYPE_LABELS).get(self.scan_vtype.get(), "4 bytes")
+        stype = dict(self._SCAN_TYPE_LABELS).get(self.scan_stype.get(), "exact")
+        return vtype, stype
+
+    def _render_scan(self, res):
+        """Render a scanner result dict into the tree + status (main thread)."""
+        if "error" in res:
+            self.scan_status.set(res["error"])
+            self._set_scan_buttons(True)
+            return
+        self.scan_tree.delete(*self.scan_tree.get_children())
+        for row in res.get("results", []):
+            self.scan_tree.insert("", "end", text=row["address"],
+                                  values=(row["value"], row.get("module", "")))
+        count = res.get("count", 0)
+        msg = "{} result(s).".format(count)
+        if res.get("truncated"):
+            msg += " Showing first {} — narrow your value/region.".format(
+                self.scanner.PREVIEW_LIMIT)
+        self.scan_status.set(msg)
+        self._set_scan_buttons(True)
+
+    def _set_scan_buttons(self, enabled):
+        state = tk.NORMAL if enabled else tk.DISABLED
+        self.scan_first_btn.config(state=state)
+        self.scan_next_btn.config(state=state)
+
+    def _run_scan_async(self, fn):
+        """Run a (possibly slow) scan on a worker thread, render on the main one."""
+        if not self.engine.is_attached():
+            self.scan_status.set("Attach to a game first (Value Scanner reads "
+                                 "live memory).")
+            return
+        self._set_scan_buttons(False)
+        self.scan_status.set("Scanning…")
+
+        def _worker():
+            try:
+                res = fn()
+            except Exception as exc:                 # never leave UI stuck
+                res = {"error": "Scan failed: {}".format(exc)}
+            self.root.after(0, lambda: self._render_scan(res))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def on_first_scan(self):
+        vtype, stype = self._scan_selected_keys()
+        if stype not in ("exact", "unknown"):
+            self.scan_status.set("First Scan supports only Exact Value or "
+                                 "Unknown Initial Value.")
+            return
+        value = self.scan_value.get()
+        region = self.scan_region.get().strip() or "All"
+        self._run_scan_async(
+            lambda: self.scanner.first_scan(vtype, stype, value, region))
+
+    def on_next_scan(self):
+        _vtype, stype = self._scan_selected_keys()
+        if stype == "unknown":
+            self.scan_status.set("Pick a Next Scan type (Increased, Decreased, "
+                                 "Exact Value, …).")
+            return
+        value = self.scan_value.get()
+        self._run_scan_async(lambda: self.scanner.next_scan(stype, value))
+
+    def on_undo_scan(self):
+        self._render_scan(self.scanner.undo())
+
+    def on_new_scan(self):
+        self._render_scan(self.scanner.new_scan())
+        self.scan_status.set("New scan — ready for First Scan.")
+
+    def on_refresh_values(self):
+        if not self.engine.is_attached():
+            self.scan_status.set("Attach to a game first.")
+            return
+        res = self.scanner.refresh_values()
+        if "error" in res:
+            self.scan_status.set(res["error"])
+            return
+        self.scan_tree.delete(*self.scan_tree.get_children())
+        for row in res.get("results", []):
+            self.scan_tree.insert("", "end", text=row["address"],
+                                  values=(row["value"], row.get("module", "")))
+        self.scan_status.set("{} result(s) — values refreshed.".format(
+            res.get("count", 0)))
+
+    def _copy_scan_address(self, _event=None):
+        sel = self.scan_tree.selection()
+        if not sel:
+            return
+        address = self.scan_tree.item(sel[0], "text")
+        self.root.clipboard_clear()
+        self.root.clipboard_append(address)
+        self.scan_status.set("Copied {} to clipboard.".format(address))
 
     # ---- Details / Preview tab --------------------------------------
     def _build_details_tab(self):
