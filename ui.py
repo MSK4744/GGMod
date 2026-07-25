@@ -407,6 +407,10 @@ class GGModUI:
 
     # Fixed-ish width of the right-hand controls column in the scanner tab.
     _SCAN_CTRL_WIDTH = 250
+    # Live auto-refresh cadence (CE-style) and how long a changed-value flash
+    # stays lit before it resets.
+    _SCAN_AUTO_MS = 250
+    _SCAN_FLASH_MS = 700
 
     def _build_scanner_tab(self):
         tab = tk.Frame(self.notebook, bg=BG)
@@ -494,6 +498,22 @@ class GGModUI:
                            self._copy_scan_address).grid(
             row=3, column=0, columnspan=2, sticky="ew", pady=2)
 
+        # Live auto-refresh toggle (CE-style continuous value updates). Default
+        # ON, but it only actually runs once a scan has results and the tab is
+        # visible + attached (see _update_scan_auto). State lives here so the
+        # loop can be armed/paused from tab-change / attach / detach events.
+        self._scan_auto_job = None
+        self._scan_prev_vals = {}      # iid -> last shown value (flash compare)
+        self._scan_flash_jobs = {}     # iid -> pending flash-reset after() id
+        self.scan_auto = tk.BooleanVar(value=True)
+        auto = tk.Frame(controls, bg=BG)
+        auto.pack(fill=tk.X, pady=(2, 0))
+        tk.Checkbutton(
+            auto, text="Auto-refresh (live)", variable=self.scan_auto,
+            command=self.on_toggle_scan_auto, bg=BG, fg=FG, selectcolor=BG3,
+            activebackground=BG, activeforeground=FG,
+            font=(FONT, 9)).pack(side=tk.LEFT)
+
         self.scan_status = tk.StringVar(value="Not scanned yet.")
         self._label(controls, "", fg=MUTED, textvariable=self.scan_status,
                     wraplength=self._SCAN_CTRL_WIDTH - 8, justify="left"
@@ -569,6 +589,13 @@ class GGModUI:
         sb.config(command=self.scan_tree.yview)
         # Double-click a row copies its address to the clipboard.
         self.scan_tree.bind("<Double-1>", self._copy_scan_address)
+        # Flash colours for live-changed values (green=up, red=down, amber=other).
+        self.scan_tree.tag_configure("flash_up",
+                                     background="#14432a", foreground="#4ade80")
+        self.scan_tree.tag_configure("flash_down",
+                                     background="#4a1414", foreground="#f87171")
+        self.scan_tree.tag_configure("flash_chg",
+                                     background="#3a3414", foreground="#facc15")
 
         # Register the panes: results left (stretches with the window), controls
         # right (fixed-ish, minsize keeps it usable). Dragging the sash between
@@ -617,16 +644,33 @@ class GGModUI:
         stype = dict(self._SCAN_TYPE_LABELS).get(self.scan_stype.get(), "exact")
         return vtype, stype
 
+    def _fill_scan_tree(self, rows):
+        """Rebuild the results tree from scratch, keyed by address (iid) so the
+        live auto-refresh can update rows in place. Resets flash tracking."""
+        # Cancel any pending flash resets from the previous result set.
+        for job in self._scan_flash_jobs.values():
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self._scan_flash_jobs = {}
+        self._scan_prev_vals = {}
+        self.scan_tree.delete(*self.scan_tree.get_children())
+        for row in rows:
+            iid = row["address"]
+            self.scan_tree.insert(
+                "", "end", iid=iid, text=row["address"],
+                values=(row["value"], row.get("previous", ""),
+                        row.get("module", "")))
+            self._scan_prev_vals[iid] = row["value"]
+
     def _render_scan(self, res):
         """Render a scanner result dict into the tree + status (main thread)."""
         if "error" in res:
             self.scan_status.set(res["error"])
             self._set_scan_buttons(True)
             return
-        self.scan_tree.delete(*self.scan_tree.get_children())
-        for row in res.get("results", []):
-            self.scan_tree.insert("", "end", text=row["address"],
-                                  values=(row["value"], row.get("previous", ""), row.get("module", "")))
+        self._fill_scan_tree(res.get("results", []))
         count = res.get("count", 0)
         msg = "{} result(s).".format(count)
         if res.get("truncated"):
@@ -634,6 +678,8 @@ class GGModUI:
                 self.scanner.PREVIEW_LIMIT)
         self.scan_status.set(msg)
         self._set_scan_buttons(True)
+        # A fresh result set may enable (or, if empty, disable) live refresh.
+        self._update_scan_auto()
 
     def _set_scan_buttons(self, enabled):
         state = tk.NORMAL if enabled else tk.DISABLED
@@ -693,12 +739,112 @@ class GGModUI:
         if "error" in res:
             self.scan_status.set(res["error"])
             return
-        self.scan_tree.delete(*self.scan_tree.get_children())
-        for row in res.get("results", []):
-            self.scan_tree.insert("", "end", text=row["address"],
-                                  values=(row["value"], row.get("previous", ""), row.get("module", "")))
+        self._fill_scan_tree(res.get("results", []))
         self.scan_status.set("{} result(s) — values refreshed.".format(
             res.get("count", 0)))
+
+    # ---- Live auto-refresh (CE-style continuous value updates) -----------
+    def on_toggle_scan_auto(self):
+        """Checkbox handler: arm or pause the live-refresh loop."""
+        self._update_scan_auto()
+
+    def _scan_auto_wanted(self):
+        """True only when it's safe & useful to be live-refreshing: toggle on,
+        attached, the Value Scanner tab is the visible one, and a scan has
+        results to show."""
+        try:
+            if not self.scan_auto.get():
+                return False
+            if not self.engine.is_attached():
+                return False
+            if self.notebook.index("current") != 2:
+                return False
+            return bool(self.scanner.results)
+        except Exception:
+            return False
+
+    def _update_scan_auto(self):
+        """Start the loop if it should run and isn't, or stop it if it
+        shouldn't. Called from tab-change, attach/detach, toggle, and after
+        every render so the timer never leaks or spins needlessly."""
+        want = self._scan_auto_wanted()
+        if want and self._scan_auto_job is None:
+            self._scan_auto_job = self.root.after(
+                self._SCAN_AUTO_MS, self._scan_auto_tick)
+        elif not want and self._scan_auto_job is not None:
+            try:
+                self.root.after_cancel(self._scan_auto_job)
+            except Exception:
+                pass
+            self._scan_auto_job = None
+
+    def _scan_auto_tick(self):
+        """One live-refresh pass: re-read only the displayed candidates' values
+        (no scan-type filtering, no Previous change, no scan-state advance) and
+        update the Value column in place, flashing changed rows."""
+        self._scan_auto_job = None
+        if not self._scan_auto_wanted():
+            return
+        try:
+            res = self.scanner.refresh_values()   # displayed subset only
+        except Exception:
+            res = {"error": "read failed"}
+        if "error" not in res:
+            self._apply_live_values(res.get("results", []))
+        # Re-arm for the next tick (conditions re-checked at the top).
+        self._update_scan_auto()
+
+    def _apply_live_values(self, rows):
+        """Update the Value cell of each already-rendered row in place, flashing
+        rows whose value moved since the last tick. Leaves Previous untouched."""
+        for row in rows:
+            iid = row["address"]
+            if not self.scan_tree.exists(iid):
+                continue
+            new_val = row["value"]
+            old_val = self._scan_prev_vals.get(iid)
+            if new_val != old_val:
+                self.scan_tree.set(iid, "value", new_val)
+                if old_val is not None:
+                    self._flash_row(iid, self._value_direction(old_val, new_val))
+                self._scan_prev_vals[iid] = new_val
+
+    @staticmethod
+    def _value_direction(old, new):
+        """'up'/'down' for numeric moves, 'changed' for anything else."""
+        try:
+            o, n = float(old), float(new)
+        except (TypeError, ValueError):
+            return "changed"
+        if n > o:
+            return "up"
+        if n < o:
+            return "down"
+        return None
+
+    def _flash_row(self, iid, direction):
+        tag = {"up": "flash_up", "down": "flash_down",
+               "changed": "flash_chg"}.get(direction)
+        if not tag:
+            return
+        self.scan_tree.item(iid, tags=(tag,))
+        # Cancel a still-pending reset so a steadily-changing row stays lit.
+        prev = self._scan_flash_jobs.get(iid)
+        if prev is not None:
+            try:
+                self.root.after_cancel(prev)
+            except Exception:
+                pass
+        self._scan_flash_jobs[iid] = self.root.after(
+            self._SCAN_FLASH_MS, lambda i=iid: self._clear_flash(i))
+
+    def _clear_flash(self, iid):
+        self._scan_flash_jobs.pop(iid, None)
+        try:
+            if self.scan_tree.exists(iid):
+                self.scan_tree.item(iid, tags=())
+        except Exception:
+            pass
 
     def _copy_scan_address(self, _event=None):
         sel = self.scan_tree.selection()
@@ -727,6 +873,8 @@ class GGModUI:
         # Value Scanner tab (index 2), so other tabs keep the mod list.
         if self._scanner_fullwindow and self.notebook.index("current") != 2:
             self._toggle_scanner_fullwindow()
+        # Entering the scanner arms live refresh; leaving it pauses the loop.
+        self._update_scan_auto()
 
     # ---- Scan hotkeys: global, user-bindable, reuse HotkeyManager --------
     def _scan_key_conflict(self, key, exclude_action=None):
@@ -1646,6 +1794,7 @@ class GGModUI:
             self.status_label.config(fg=RED)
         self.refresh_mod_list()
         self._apply_scan_hotkeys()   # activate scan hotkeys now attached (if on)
+        self._update_scan_auto()     # resume live refresh if toggle still on
 
     def on_detach(self):
         if not self.engine.is_attached():
@@ -1661,6 +1810,7 @@ class GGModUI:
         self.preview_ready_for = None
         self.refresh_mod_list()
         self._apply_scan_hotkeys()   # attached now False -> unregisters scan keys
+        self._update_scan_auto()     # not attached -> pauses live refresh
 
     def update_status(self):
         if self.engine.is_attached():
@@ -2702,6 +2852,20 @@ class GGModUI:
     # ==================================================================
     def on_close(self):
         try:
+            # Stop the live auto-refresh loop + any pending flash resets so no
+            # timer fires against a destroyed window or detached process.
+            if self._scan_auto_job is not None:
+                try:
+                    self.root.after_cancel(self._scan_auto_job)
+                except Exception:
+                    pass
+                self._scan_auto_job = None
+            for job in self._scan_flash_jobs.values():
+                try:
+                    self.root.after_cancel(job)
+                except Exception:
+                    pass
+            self._scan_flash_jobs.clear()
             if self.engine.is_attached():
                 self.log("Closing: detaching (stopping threads, restoring bytes)...")
                 self.on_detach()          # detaches engine (keeps bindings)
