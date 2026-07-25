@@ -65,6 +65,26 @@ _kernel32.VirtualQueryEx.argtypes = [
     ctypes.POINTER(MEMORY_BASIC_INFORMATION), ctypes.c_size_t,
 ]
 
+_kernel32.IsWow64Process.restype = wintypes.BOOL
+_kernel32.IsWow64Process.argtypes = [wintypes.HANDLE,
+                                     ctypes.POINTER(wintypes.BOOL)]
+
+
+def process_is_wow64(handle):
+    """True if `handle`'s process is 32-bit running under WoW64.
+
+    Asks Windows directly instead of trusting pymem's is_WoW64 attribute,
+    which is only populated on some of pymem's construction paths (it stays
+    False after open_process_from_id). Bitness drives BOTH the capstone
+    disassembly mode and the debugger's thread-context API choice, so getting
+    it wrong corrupts decoding and thread contexts alike. Returns None if the
+    query fails, letting the caller fall back.
+    """
+    flag = wintypes.BOOL()
+    if not _kernel32.IsWow64Process(handle, ctypes.byref(flag)):
+        return None
+    return bool(flag.value)
+
 MEM_COMMIT = 0x1000
 MEM_RESERVE = 0x2000
 PAGE_EXECUTE_READWRITE = 0x40
@@ -287,13 +307,17 @@ class TrainerEngine:
             return False
 
         self.process_name = process_name
-        # is_WoW64 True => a 32-bit process running under WOW64 on 64-bit
-        # Windows. Treat anything that is NOT WoW64 as 64-bit. (On a 32-bit
-        # OS this would misreport, but GGMod targets modern 64-bit Windows.)
-        try:
-            self._is64 = not bool(self.pm.is_WoW64)
-        except Exception:
-            self._is64 = True
+        # WoW64 => a 32-bit process on 64-bit Windows; anything else is 64-bit.
+        # (On a 32-bit OS this would misreport, but GGMod targets modern 64-bit
+        # Windows.) Ask Windows directly and only fall back to pymem's
+        # attribute, which is not populated on every pymem construction path.
+        wow64 = process_is_wow64(self.pm.process_handle)
+        if wow64 is None:
+            try:
+                wow64 = bool(self.pm.is_WoW64)
+            except Exception:
+                wow64 = False
+        self._is64 = not wow64
         self._log(
             "Attached to '{}' (pid {}, {}).".format(
                 process_name, self.pm.process_id, "x64" if self._is64 else "x86"
@@ -2043,17 +2067,42 @@ UNLOAD_DLL_DEBUG_EVENT = 7
 OUTPUT_DEBUG_STRING_EVENT = 8
 RIP_EVENT = 9
 
-# Exception codes we care about
+# Exception codes we care about.
 EXCEPTION_SINGLE_STEP = 0x80000004      # what a data breakpoint raises
 EXCEPTION_BREAKPOINT = 0x80000003       # the int3 injected when we attach
+# WoW64 equivalents. When a 64-bit debugger debugs a 32-bit process, traps
+# raised by the 32-bit code arrive under these WX86 codes instead of the
+# native ones above. Failing to recognise them is fatal, not cosmetic: the
+# trap falls through to DBG_EXCEPTION_NOT_HANDLED and our own breakpoint gets
+# delivered to the game as an unhandled exception, killing it instantly.
+STATUS_WX86_SINGLE_STEP = 0x4000001E
+STATUS_WX86_BREAKPOINT = 0x4000001F
+
+# Every code that means "this trap is ours to swallow".
+_OUR_SINGLE_STEP = (EXCEPTION_SINGLE_STEP, STATUS_WX86_SINGLE_STEP)
+_OUR_BREAKPOINT = (EXCEPTION_BREAKPOINT, STATUS_WX86_BREAKPOINT)
+_OUR_TRAPS = _OUR_SINGLE_STEP + _OUR_BREAKPOINT
 
 DBG_CONTINUE = 0x00010002
 DBG_EXCEPTION_NOT_HANDLED = 0x80010001
 
 # CONTEXT flag sets (architecture-specific prefixes: AMD64=0x00100000,
 # x86=0x00010000; |0x10 = DEBUG_REGISTERS, |0x01 = CONTROL for Rip/Eip).
-CONTEXT_AMD64_DEBUG = 0x00100000 | 0x10 | 0x00000001
-CONTEXT_X86_DEBUG = 0x00010000 | 0x10 | 0x00000001
+# Architecture prefixes: AMD64=0x00100000, x86=0x00010000.
+# 0x01 = CONTEXT_CONTROL (Rip/Eip, Rsp/Esp, segment regs, EFlags)
+# 0x10 = CONTEXT_DEBUG_REGISTERS (Dr0-Dr7)
+#
+# These MUST stay separate. SetThreadContext writes back every group named in
+# ContextFlags, so including CONTEXT_CONTROL while arming a breakpoint would
+# rewrite the thread's instruction and stack pointers from the snapshot we
+# read. For a suspended WoW64 thread that snapshot can be stale (the thread may
+# be mid-transition inside wow64cpu.dll), and restoring a stale Eip/Esp crashes
+# the target the moment it resumes. Arming therefore uses *_DEBUG_ONLY, and
+# CONTROL is only ever used for READS, where writing nothing back is safe.
+CONTEXT_AMD64_DEBUG_ONLY = 0x00100000 | 0x10
+CONTEXT_X86_DEBUG_ONLY = 0x00010000 | 0x10
+CONTEXT_AMD64_CONTROL = 0x00100000 | 0x00000001
+CONTEXT_X86_CONTROL = 0x00010000 | 0x00000001
 
 # DR7 length encoding. Note 8 bytes is x64-only, and the watched address must
 # be aligned to the length or the CPU simply won't trap correctly.
@@ -2235,6 +2284,39 @@ except AttributeError:                  # 32-bit Windows has no WoW64 layer
 
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
+# Is GGMod ITSELF a 64-bit process? This matters as much as the target's
+# bitness: the Wow64*ThreadContext APIs exist to let a 64-bit caller reach a
+# 32-bit thread's context, and they are the wrong call in any other pairing.
+_SELF_IS64 = ctypes.sizeof(ctypes.c_void_p) == 8
+
+# Which context API pairing to use for a given (debugger, target) bitness.
+CTX_NATIVE64 = "native64"    # 64-bit GGMod  -> 64-bit target
+CTX_NATIVE32 = "native32"    # 32-bit GGMod  -> 32-bit target (no WoW64 layer)
+CTX_WOW64 = "wow64"          # 64-bit GGMod  -> 32-bit target (WoW64)
+CTX_UNSUPPORTED = "unsupported"   # 32-bit GGMod -> 64-bit target
+
+
+def context_mode(target_is64, self_is64=None, have_wow64=None):
+    """Pick the thread-context API path for a debugger/target bitness pair.
+
+    Windows requires Wow64GetThreadContext/Wow64SetThreadContext specifically
+    when a 64-bit process manipulates a 32-bit (WoW64) thread's context --
+    plain Get/SetThreadContext there returns the 64-bit wow64cpu.dll context,
+    not the game's real 32-bit one. Conversely a 32-bit debugger talking to a
+    32-bit target has no WoW64 layer at all and must use the plain APIs, whose
+    native CONTEXT is the 32-bit layout. A 32-bit process cannot debug a
+    64-bit one at all.
+    """
+    if self_is64 is None:
+        self_is64 = _SELF_IS64
+    if have_wow64 is None:
+        have_wow64 = _HAVE_WOW64_CTX
+    if target_is64:
+        return CTX_NATIVE64 if self_is64 else CTX_UNSUPPORTED
+    if not self_is64:
+        return CTX_NATIVE32
+    return CTX_WOW64 if have_wow64 else CTX_UNSUPPORTED
+
 
 def _alloc_context64():
     """Return (backing_buffer, CONTEXT64 view) 16-byte aligned.
@@ -2325,6 +2407,14 @@ class DebugSession:
 
         self._pid = int(self.engine.pm.process_id)
         self._is64 = bool(getattr(self.engine, "_is64", True))
+        mode = context_mode(self._is64)
+        if mode == CTX_UNSUPPORTED:
+            return {"error": (
+                "Cannot debug a 64-bit game from a 32-bit GGMod build. Use "
+                "the 64-bit build to watch this process."
+                if self._is64 else
+                "This Windows build has no WoW64 thread-context support, so a "
+                "32-bit game cannot be watched from 64-bit GGMod.")}
         self._address = address
         self._size = self._usable_size(address, size)
         self._hit_no = 0
@@ -2475,7 +2565,16 @@ class DebugSession:
     def _apply_dr(self, tid, address, dr7):
         """Set (or clear, with address=0/dr7=0) the slot-0 debug register on
         one thread. Returns True on success. Suspends the thread around the
-        context swap, which is required for a reliable SetThreadContext."""
+        context swap, which is required for a reliable SetThreadContext.
+
+        Only CONTEXT_DEBUG_REGISTERS is requested, so SetThreadContext writes
+        back the debug registers and NOTHING else. Including CONTEXT_CONTROL
+        here would also restore Eip/Esp from the snapshot -- unreliable for a
+        suspended WoW64 thread and a crash-on-resume for the target.
+        """
+        mode = context_mode(self._is64)
+        if mode == CTX_UNSUPPORTED:
+            return False
         handle = _kernel32.OpenThread(_THREAD_BP_ACCESS, False, tid)
         if not handle:
             return False
@@ -2483,30 +2582,34 @@ class DebugSession:
             if _kernel32.SuspendThread(handle) == 0xFFFFFFFF:
                 return False
             try:
-                use_wow64 = (not self._is64) and _HAVE_WOW64_CTX
-                if use_wow64:
-                    ctx = WOW64_CONTEXT()
-                    ctx.ContextFlags = CONTEXT_X86_DEBUG
-                    if not _kernel32.Wow64GetThreadContext(
-                            handle, ctypes.byref(ctx)):
+                if mode == CTX_NATIVE64:
+                    _raw, ctx = _alloc_context64()
+                    ctx.ContextFlags = CONTEXT_AMD64_DEBUG_ONLY
+                    if not _kernel32.GetThreadContext(handle,
+                                                      ctypes.byref(ctx)):
                         return False
-                    ctx.Dr0 = address & 0xFFFFFFFF
+                    ctx.Dr0 = address
                     ctx.Dr6 = 0
-                    ctx.Dr7 = dr7 & 0xFFFFFFFF
-                    ctx.ContextFlags = CONTEXT_X86_DEBUG
-                    return bool(_kernel32.Wow64SetThreadContext(
-                        handle, ctypes.byref(ctx)))
-                _raw, ctx = _alloc_context64()
-                ctx.ContextFlags = CONTEXT_AMD64_DEBUG
-                if not _kernel32.GetThreadContext(handle,
-                                                  ctypes.byref(ctx)):
+                    ctx.Dr7 = dr7
+                    ctx.ContextFlags = CONTEXT_AMD64_DEBUG_ONLY
+                    return bool(_kernel32.SetThreadContext(handle,
+                                                           ctypes.byref(ctx)))
+                # Both 32-bit target paths share the 32-bit CONTEXT layout and
+                # differ only in which API reaches it: Wow64* from a 64-bit
+                # GGMod, the plain ones when GGMod is itself 32-bit.
+                get = (_kernel32.Wow64GetThreadContext if mode == CTX_WOW64
+                       else _kernel32.GetThreadContext)
+                put = (_kernel32.Wow64SetThreadContext if mode == CTX_WOW64
+                       else _kernel32.SetThreadContext)
+                ctx = WOW64_CONTEXT()
+                ctx.ContextFlags = CONTEXT_X86_DEBUG_ONLY
+                if not get(handle, ctypes.byref(ctx)):
                     return False
-                ctx.Dr0 = address
+                ctx.Dr0 = address & 0xFFFFFFFF
                 ctx.Dr6 = 0
-                ctx.Dr7 = dr7
-                ctx.ContextFlags = CONTEXT_AMD64_DEBUG
-                return bool(_kernel32.SetThreadContext(handle,
-                                                       ctypes.byref(ctx)))
+                ctx.Dr7 = dr7 & 0xFFFFFFFF
+                ctx.ContextFlags = CONTEXT_X86_DEBUG_ONLY
+                return bool(put(handle, ctypes.byref(ctx)))
             finally:
                 _kernel32.ResumeThread(handle)
         finally:
@@ -2565,8 +2668,9 @@ class DebugSession:
             if evt.dwDebugEventCode == EXCEPTION_DEBUG_EVENT:
                 code = (evt.u.Exception.ExceptionRecord.ExceptionCode
                         & 0xFFFFFFFF)
-                # Swallow our own traps; hand anything else back to the game.
-                if code not in (EXCEPTION_SINGLE_STEP, EXCEPTION_BREAKPOINT):
+                # Swallow our own traps (native and WoW64 WX86 codes alike);
+                # hand anything else back to the game.
+                if code not in _OUR_TRAPS:
                     status = DBG_EXCEPTION_NOT_HANDLED
             exiting = evt.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT
             _kernel32.ContinueDebugEvent(evt.dwProcessId, evt.dwThreadId,
@@ -2654,36 +2758,48 @@ class DebugSession:
         rec = evt.u.Exception.ExceptionRecord
         code = rec.ExceptionCode & 0xFFFFFFFF
 
-        if code == EXCEPTION_SINGLE_STEP:
+        if code in _OUR_SINGLE_STEP:
+            # Native STATUS_SINGLE_STEP, or STATUS_WX86_SINGLE_STEP when the
+            # trap came from 32-bit code in a WoW64 target.
             try:
                 self._record_hit(evt.dwThreadId)
             except Exception as exc:
                 self._log("Error recording hit: {}".format(exc))
             return DBG_CONTINUE
-        if code == EXCEPTION_BREAKPOINT:
+        if code in _OUR_BREAKPOINT:
             # The int3 Windows injects into the target when a debugger
             # attaches. Ours to swallow; passing it on would crash the game.
             return DBG_CONTINUE
         return DBG_EXCEPTION_NOT_HANDLED
 
     def _read_ip(self, tid):
-        """Return the trapping thread's instruction pointer, or None."""
+        """Return the trapping thread's instruction pointer, or None.
+
+        Read-only, so CONTEXT_CONTROL is safe to request here -- nothing is
+        written back. For a WoW64 target the 32-bit Eip is the game's real
+        instruction pointer; the 64-bit Rip of such a thread points into
+        wow64cpu.dll and would be useless for locating game code.
+        """
+        mode = context_mode(self._is64)
+        if mode == CTX_UNSUPPORTED:
+            return None
         handle = _kernel32.OpenThread(_THREAD_BP_ACCESS, False, tid)
         if not handle:
             return None
         try:
-            if (not self._is64) and _HAVE_WOW64_CTX:
-                ctx = WOW64_CONTEXT()
-                ctx.ContextFlags = CONTEXT_X86_DEBUG
-                if not _kernel32.Wow64GetThreadContext(handle,
-                                                       ctypes.byref(ctx)):
+            if mode == CTX_NATIVE64:
+                _raw, ctx = _alloc_context64()
+                ctx.ContextFlags = CONTEXT_AMD64_CONTROL
+                if not _kernel32.GetThreadContext(handle, ctypes.byref(ctx)):
                     return None
-                return int(ctx.Eip)
-            _raw, ctx = _alloc_context64()
-            ctx.ContextFlags = CONTEXT_AMD64_DEBUG
-            if not _kernel32.GetThreadContext(handle, ctypes.byref(ctx)):
+                return int(ctx.Rip)
+            get = (_kernel32.Wow64GetThreadContext if mode == CTX_WOW64
+                   else _kernel32.GetThreadContext)
+            ctx = WOW64_CONTEXT()
+            ctx.ContextFlags = CONTEXT_X86_CONTROL
+            if not get(handle, ctypes.byref(ctx)):
                 return None
-            return int(ctx.Rip)
+            return int(ctx.Eip)
         finally:
             _kernel32.CloseHandle(handle)
 
@@ -2700,11 +2816,19 @@ class DebugSession:
 
         Returns (address, text, bytes_hex) for the writer, or None.
         """
-        window = 24
-        start = next_ip - window
-        blob = self.engine._read(start, window)
+        # Try the widest lookback first, then shrink. The read can fail
+        # outright when next_ip sits near the start of its region (the window
+        # would cross into unmapped memory), which must not cost us the hit --
+        # a smaller window still resolves the instruction.
+        blob, window = None, 0
+        for size in (24, 16, 12, 8, 6, 4, 3, 2):
+            data = self.engine._read(next_ip - size, size)
+            if data:
+                blob, window = data, size
+                break
         if not blob:
             return None
+        start = next_ip - window
         md = self.engine._make_disassembler(self._is64)
         best = None
         for back in range(window, 1, -1):
