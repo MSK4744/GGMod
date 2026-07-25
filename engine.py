@@ -15,6 +15,7 @@ comments and surfaced via the log callback.
 
 import ctypes
 import json
+import queue
 import re
 import struct
 import threading
@@ -1997,3 +1998,763 @@ class MemoryScanner:
             return True
         except Exception:
             return False
+
+
+# ---------------------------------------------------------------------------
+# Part B: "Find what writes to this address" -- hardware-breakpoint debugger.
+# ---------------------------------------------------------------------------
+# Everything else in GGMod talks to the game with plain ReadProcessMemory /
+# WriteProcessMemory through pymem. Catching a hardware (data) breakpoint is
+# fundamentally different: it requires GGMod to become the target's actual
+# Windows DEBUGGER via DebugActiveProcess plus a WaitForDebugEvent /
+# ContinueDebugEvent loop.
+#
+# Consequences that shape the design below:
+#   * Only ONE debugger can be attached to a process at a time, so this is an
+#     explicit, user-started session -- never an always-on background mode. It
+#     WILL conflict with Cheat Engine's own debug mode on the same process.
+#   * Win32 binds debugging to the THREAD that called DebugActiveProcess: only
+#     that same thread may call WaitForDebugEvent / ContinueDebugEvent /
+#     DebugActiveProcessStop. So every debug API call happens on DebugSession's
+#     single worker thread; start()/stop() merely hand it a request and read
+#     results back through Event/Queue objects.
+#   * A hardware breakpoint left set in a thread's debug registers after the
+#     debugger goes away will fault with nobody to handle it and take the game
+#     down. Clearing DR0/DR7 on every thread BEFORE DebugActiveProcessStop is
+#     therefore mandatory, not best-effort -- see _clear_breakpoints/_cleanup.
+
+TH32CS_SNAPTHREAD = 0x00000004
+
+THREAD_GET_CONTEXT = 0x0008
+THREAD_SET_CONTEXT = 0x0010
+THREAD_SUSPEND_RESUME = 0x0002
+THREAD_QUERY_INFORMATION = 0x0040
+_THREAD_BP_ACCESS = (THREAD_GET_CONTEXT | THREAD_SET_CONTEXT
+                     | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION)
+
+# Debug event codes
+EXCEPTION_DEBUG_EVENT = 1
+CREATE_THREAD_DEBUG_EVENT = 2
+CREATE_PROCESS_DEBUG_EVENT = 3
+EXIT_THREAD_DEBUG_EVENT = 4
+EXIT_PROCESS_DEBUG_EVENT = 5
+LOAD_DLL_DEBUG_EVENT = 6
+UNLOAD_DLL_DEBUG_EVENT = 7
+OUTPUT_DEBUG_STRING_EVENT = 8
+RIP_EVENT = 9
+
+# Exception codes we care about
+EXCEPTION_SINGLE_STEP = 0x80000004      # what a data breakpoint raises
+EXCEPTION_BREAKPOINT = 0x80000003       # the int3 injected when we attach
+
+DBG_CONTINUE = 0x00010002
+DBG_EXCEPTION_NOT_HANDLED = 0x80010001
+
+# CONTEXT flag sets (architecture-specific prefixes: AMD64=0x00100000,
+# x86=0x00010000; |0x10 = DEBUG_REGISTERS, |0x01 = CONTROL for Rip/Eip).
+CONTEXT_AMD64_DEBUG = 0x00100000 | 0x10 | 0x00000001
+CONTEXT_X86_DEBUG = 0x00010000 | 0x10 | 0x00000001
+
+# DR7 length encoding. Note 8 bytes is x64-only, and the watched address must
+# be aligned to the length or the CPU simply won't trap correctly.
+_DR7_LEN_BITS = {1: 0b00, 2: 0b01, 4: 0b11, 8: 0b10}
+_DR7_RW_WRITE = 0b01                    # break on data WRITE
+_DR7_LE = 1 << 8                        # local exact breakpoint (ignored on
+                                        # modern CPUs, harmless to set)
+
+ERROR_SEM_TIMEOUT = 121
+ERROR_ACCESS_DENIED = 5
+ERROR_NOT_SUPPORTED = 50
+ERROR_INVALID_PARAMETER = 87
+_STILL_ACTIVE = 259
+
+_kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+_kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE,
+                                         ctypes.POINTER(wintypes.DWORD)]
+
+
+class THREADENTRY32(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ThreadID", wintypes.DWORD),
+        ("th32OwnerProcessID", wintypes.DWORD),
+        ("tpBasePri", ctypes.c_long),
+        ("tpDeltaPri", ctypes.c_long),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+class EXCEPTION_RECORD(ctypes.Structure):
+    pass
+
+
+EXCEPTION_RECORD._fields_ = [
+    ("ExceptionCode", wintypes.DWORD),
+    ("ExceptionFlags", wintypes.DWORD),
+    ("ExceptionRecord", ctypes.POINTER(EXCEPTION_RECORD)),
+    ("ExceptionAddress", ctypes.c_void_p),
+    ("NumberParameters", wintypes.DWORD),
+    ("ExceptionInformation", ctypes.c_size_t * 15),
+]
+
+
+class EXCEPTION_DEBUG_INFO(ctypes.Structure):
+    _fields_ = [
+        ("ExceptionRecord", EXCEPTION_RECORD),
+        ("dwFirstChance", wintypes.DWORD),
+    ]
+
+
+class _DEBUG_EVENT_UNION(ctypes.Union):
+    # Only the exception arm is read; _raw just guarantees the union is large
+    # enough for every other event kind the OS may write into it.
+    _fields_ = [
+        ("Exception", EXCEPTION_DEBUG_INFO),
+        ("_raw", ctypes.c_byte * 176),
+    ]
+
+
+class DEBUG_EVENT(ctypes.Structure):
+    _fields_ = [
+        ("dwDebugEventCode", wintypes.DWORD),
+        ("dwProcessId", wintypes.DWORD),
+        ("dwThreadId", wintypes.DWORD),
+        ("u", _DEBUG_EVENT_UNION),
+    ]
+
+
+class CONTEXT64(ctypes.Structure):
+    """x64 CONTEXT, declared exactly through Rip (offset 248) with the rest as
+    opaque tail padding so the total size matches the real 1232-byte struct.
+    Only ContextFlags / Dr0-Dr7 / Rip are ever touched, and all of those sit in
+    the declared prefix. The struct needs 16-byte alignment, which ctypes will
+    not guarantee -- see _alloc_context64()."""
+    _fields_ = [
+        ("P1Home", ctypes.c_ulonglong), ("P2Home", ctypes.c_ulonglong),
+        ("P3Home", ctypes.c_ulonglong), ("P4Home", ctypes.c_ulonglong),
+        ("P5Home", ctypes.c_ulonglong), ("P6Home", ctypes.c_ulonglong),
+        ("ContextFlags", wintypes.DWORD), ("MxCsr", wintypes.DWORD),
+        ("SegCs", wintypes.WORD), ("SegDs", wintypes.WORD),
+        ("SegEs", wintypes.WORD), ("SegFs", wintypes.WORD),
+        ("SegGs", wintypes.WORD), ("SegSs", wintypes.WORD),
+        ("EFlags", wintypes.DWORD),
+        ("Dr0", ctypes.c_ulonglong), ("Dr1", ctypes.c_ulonglong),
+        ("Dr2", ctypes.c_ulonglong), ("Dr3", ctypes.c_ulonglong),
+        ("Dr6", ctypes.c_ulonglong), ("Dr7", ctypes.c_ulonglong),
+        ("Rax", ctypes.c_ulonglong), ("Rcx", ctypes.c_ulonglong),
+        ("Rdx", ctypes.c_ulonglong), ("Rbx", ctypes.c_ulonglong),
+        ("Rsp", ctypes.c_ulonglong), ("Rbp", ctypes.c_ulonglong),
+        ("Rsi", ctypes.c_ulonglong), ("Rdi", ctypes.c_ulonglong),
+        ("R8", ctypes.c_ulonglong), ("R9", ctypes.c_ulonglong),
+        ("R10", ctypes.c_ulonglong), ("R11", ctypes.c_ulonglong),
+        ("R12", ctypes.c_ulonglong), ("R13", ctypes.c_ulonglong),
+        ("R14", ctypes.c_ulonglong), ("R15", ctypes.c_ulonglong),
+        ("Rip", ctypes.c_ulonglong),
+        ("_tail", ctypes.c_byte * (1232 - 256)),
+    ]
+
+
+class FLOATING_SAVE_AREA(ctypes.Structure):
+    _fields_ = [
+        ("ControlWord", wintypes.DWORD), ("StatusWord", wintypes.DWORD),
+        ("TagWord", wintypes.DWORD), ("ErrorOffset", wintypes.DWORD),
+        ("ErrorSelector", wintypes.DWORD), ("DataOffset", wintypes.DWORD),
+        ("DataSelector", wintypes.DWORD), ("RegisterArea", ctypes.c_byte * 80),
+        ("Cr0NpxState", wintypes.DWORD),
+    ]
+
+
+class WOW64_CONTEXT(ctypes.Structure):
+    """32-bit CONTEXT, used for WoW64 targets (a 32-bit game on 64-bit
+    Windows). The debug registers are the same physical registers, but the
+    instruction pointer must be read as the 32-bit Eip -- the 64-bit Rip of a
+    WoW64 thread points into wow64cpu.dll, not into game code."""
+    _fields_ = [
+        ("ContextFlags", wintypes.DWORD),
+        ("Dr0", wintypes.DWORD), ("Dr1", wintypes.DWORD),
+        ("Dr2", wintypes.DWORD), ("Dr3", wintypes.DWORD),
+        ("Dr6", wintypes.DWORD), ("Dr7", wintypes.DWORD),
+        ("FloatSave", FLOATING_SAVE_AREA),
+        ("SegGs", wintypes.DWORD), ("SegFs", wintypes.DWORD),
+        ("SegEs", wintypes.DWORD), ("SegDs", wintypes.DWORD),
+        ("Edi", wintypes.DWORD), ("Esi", wintypes.DWORD),
+        ("Ebx", wintypes.DWORD), ("Edx", wintypes.DWORD),
+        ("Ecx", wintypes.DWORD), ("Eax", wintypes.DWORD),
+        ("Ebp", wintypes.DWORD), ("Eip", wintypes.DWORD),
+        ("SegCs", wintypes.DWORD), ("EFlags", wintypes.DWORD),
+        ("Esp", wintypes.DWORD), ("SegSs", wintypes.DWORD),
+        ("ExtendedRegisters", ctypes.c_byte * 512),
+    ]
+
+
+_kernel32.DebugActiveProcess.restype = wintypes.BOOL
+_kernel32.DebugActiveProcess.argtypes = [wintypes.DWORD]
+_kernel32.DebugActiveProcessStop.restype = wintypes.BOOL
+_kernel32.DebugActiveProcessStop.argtypes = [wintypes.DWORD]
+_kernel32.DebugSetProcessKillOnExit.restype = wintypes.BOOL
+_kernel32.DebugSetProcessKillOnExit.argtypes = [wintypes.BOOL]
+_kernel32.WaitForDebugEvent.restype = wintypes.BOOL
+_kernel32.WaitForDebugEvent.argtypes = [ctypes.POINTER(DEBUG_EVENT),
+                                        wintypes.DWORD]
+_kernel32.ContinueDebugEvent.restype = wintypes.BOOL
+_kernel32.ContinueDebugEvent.argtypes = [wintypes.DWORD, wintypes.DWORD,
+                                         wintypes.DWORD]
+_kernel32.OpenThread.restype = wintypes.HANDLE
+_kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_kernel32.SuspendThread.restype = wintypes.DWORD
+_kernel32.SuspendThread.argtypes = [wintypes.HANDLE]
+_kernel32.ResumeThread.restype = wintypes.DWORD
+_kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+_kernel32.CloseHandle.restype = wintypes.BOOL
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+_kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+_kernel32.Thread32First.restype = wintypes.BOOL
+_kernel32.Thread32First.argtypes = [wintypes.HANDLE,
+                                    ctypes.POINTER(THREADENTRY32)]
+_kernel32.Thread32Next.restype = wintypes.BOOL
+_kernel32.Thread32Next.argtypes = [wintypes.HANDLE,
+                                   ctypes.POINTER(THREADENTRY32)]
+# GetThreadContext/SetThreadContext take a manually 16-aligned buffer for the
+# x64 CONTEXT, so they are typed as void* rather than POINTER(CONTEXT64).
+_kernel32.GetThreadContext.restype = wintypes.BOOL
+_kernel32.GetThreadContext.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+_kernel32.SetThreadContext.restype = wintypes.BOOL
+_kernel32.SetThreadContext.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+try:
+    _kernel32.Wow64GetThreadContext.restype = wintypes.BOOL
+    _kernel32.Wow64GetThreadContext.argtypes = [wintypes.HANDLE,
+                                                ctypes.c_void_p]
+    _kernel32.Wow64SetThreadContext.restype = wintypes.BOOL
+    _kernel32.Wow64SetThreadContext.argtypes = [wintypes.HANDLE,
+                                                ctypes.c_void_p]
+    _HAVE_WOW64_CTX = True
+except AttributeError:                  # 32-bit Windows has no WoW64 layer
+    _HAVE_WOW64_CTX = False
+
+_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+
+def _alloc_context64():
+    """Return (backing_buffer, CONTEXT64 view) 16-byte aligned.
+
+    The x64 CONTEXT is declared DECLSPEC_ALIGN(16) and GetThreadContext fails
+    with ERROR_NOACCESS/invalid-parameter on a misaligned buffer, which ctypes
+    (8-byte alignment) does not guarantee. Over-allocate and align by hand. The
+    caller MUST keep the returned buffer alive for as long as the view is used.
+    """
+    raw = ctypes.create_string_buffer(ctypes.sizeof(CONTEXT64) + 16)
+    aligned = (ctypes.addressof(raw) + 15) & ~15
+    return raw, ctypes.cast(aligned, ctypes.POINTER(CONTEXT64)).contents
+
+
+def _dr7_for(slot, size):
+    """Build a DR7 value enabling `slot` (0-3) as a break-on-write watchpoint
+    of `size` bytes. Returns 0 for an unsupported size."""
+    if size not in _DR7_LEN_BITS:
+        return 0
+    enable = 1 << (slot * 2)                      # L0/L1/L2/L3 local enable
+    field = (_DR7_RW_WRITE | (_DR7_LEN_BITS[size] << 2)) << (16 + slot * 4)
+    return enable | field | _DR7_LE
+
+
+class DebugAttachError(Exception):
+    """DebugActiveProcess failed. Carries the raw Win32 error so the UI can
+    explain the common causes (already debugged / privileges)."""
+
+    def __init__(self, code, message):
+        self.code = code
+        super().__init__(message)
+
+
+class DebugSession:
+    """Watch an address for writes using an x86/x64 hardware breakpoint.
+
+    Lifecycle is strictly user-driven: start() attaches as a debugger and arms
+    DR0 on every thread; stop() disarms and detaches. Hits arrive on the
+    thread-safe `hits` queue -- the debug loop NEVER touches the UI directly.
+    """
+
+    # Slot 0 of DR0-DR3. One watched address at a time keeps the debug-register
+    # bookkeeping (and the DR6 hit attribution) trivial; the other three slots
+    # stay free and untouched.
+    _SLOT = 0
+    _WAIT_MS = 100            # WaitForDebugEvent timeout -> stop-flag polling
+    _MAX_HITS = 5000          # bound the queue if a hot instruction spams us
+
+    def __init__(self, engine, log_callback=None):
+        self.engine = engine
+        self._log = log_callback or (lambda msg: None)
+        self.hits = queue.Queue()
+        self._thread = None
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._result = None
+        self._pid = None
+        self._address = None
+        self._size = 4
+        self._is64 = True
+        self._attached = False
+        self._hit_no = 0
+        self._counts = {}         # instruction address -> times seen
+        self._armed = set()       # thread ids we successfully armed
+
+    # ---- public API (called from the UI thread) -------------------------
+    def is_running(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self, address, size=4, timeout=10.0):
+        """Attach as debugger and arm a write-watchpoint on `address`.
+
+        Blocks only until the worker reports the attach outcome, then returns
+        {"ok": True, ...} or {"error": "..."}; the event loop keeps running on
+        the worker thread afterwards.
+        """
+        if self.is_running():
+            return {"error": "A watch session is already running -- stop it first."}
+        if self.engine.pm is None:
+            return {"error": "Not attached -- attach to the game first."}
+        if capstone is None:
+            return {"error": "capstone is not installed; cannot decode the "
+                             "writing instruction."}
+        try:
+            address = int(address)
+        except (TypeError, ValueError):
+            return {"error": "Invalid address."}
+
+        self._pid = int(self.engine.pm.process_id)
+        self._is64 = bool(getattr(self.engine, "_is64", True))
+        self._address = address
+        self._size = self._usable_size(address, size)
+        self._hit_no = 0
+        self._counts = {}
+        self._armed = set()
+        self._result = None
+        self._stop.clear()
+        self._ready.clear()
+        # Drain any hits left over from a previous session.
+        while not self.hits.empty():
+            try:
+                self.hits.get_nowait()
+            except queue.Empty:
+                break
+
+        self._thread = threading.Thread(
+            target=self._run, name="GGModDebugSession", daemon=True)
+        self._thread.start()
+        if not self._ready.wait(timeout):
+            self._stop.set()
+            return {"error": "Timed out waiting for the debugger to attach."}
+        return self._result or {"error": "Debugger failed to start."}
+
+    def stop(self, timeout=10.0):
+        """Signal the worker to disarm + detach, and wait for it to finish."""
+        if not self.is_running():
+            self._stop.set()
+            return {"ok": True, "note": "No watch session was running."}
+        self._stop.set()
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            self._log("Debug session did not stop within {}s -- the debugger "
+                      "may still be attached.".format(timeout))
+            return {"error": "Watch session did not stop cleanly."}
+        self._thread = None
+        return {"ok": True}
+
+    def _usable_size(self, address, size):
+        """Clamp the watch length to something the CPU can actually arm: a
+        supported width, 8 bytes only on x64, and aligned to the address (an
+        unaligned data breakpoint does not trap reliably, so degrade rather
+        than silently miss writes)."""
+        if size not in _DR7_LEN_BITS:
+            size = 4
+        if size == 8 and not self._is64:
+            size = 4
+        while size > 1 and (address % size) != 0:
+            size //= 2
+        return size
+
+    # ---- worker thread: EVERY debug API call happens below here ---------
+    def _run(self):
+        try:
+            self._attach()
+            armed = self._set_breakpoints()
+            if not armed:
+                raise DebugAttachError(
+                    0, "Attached, but no thread could be armed with a "
+                       "hardware breakpoint.")
+            self._result = {
+                "ok": True, "pid": self._pid, "address": self._address,
+                "size": self._size, "threads": armed,
+            }
+        except DebugAttachError as exc:
+            self._result = {"error": str(exc), "code": exc.code}
+            self._safe_cleanup()
+            self._ready.set()
+            return
+        except Exception as exc:
+            self._result = {"error": "Debugger error: {}".format(exc)}
+            self._safe_cleanup()
+            self._ready.set()
+            return
+        finally:
+            self._ready.set()
+
+        try:
+            self._loop()
+        except Exception as exc:
+            self._log("Debug loop error: {}".format(exc))
+        finally:
+            self._safe_cleanup()
+
+    def _attach(self):
+        if not _kernel32.DebugActiveProcess(self._pid):
+            err = ctypes.get_last_error()
+            raise DebugAttachError(err, self._attach_error_text(err))
+        self._attached = True
+        # Without this, the game is KILLED when GGMod's debugger goes away --
+        # including if GGMod crashes. Must be set right after attaching.
+        if not _kernel32.DebugSetProcessKillOnExit(False):
+            self._log("Warning: DebugSetProcessKillOnExit failed ({}); the "
+                      "game could be killed if GGMod exits abruptly.".format(
+                          ctypes.get_last_error()))
+        self._log("Debugger attached to pid {}.".format(self._pid))
+
+    def _process_alive(self):
+        """True if the target is still running. Used to disambiguate the
+        attach error below -- Windows reports the same code either way."""
+        try:
+            handle = self.engine.pm.process_handle
+            code = wintypes.DWORD(0)
+            if not _kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True             # can't tell; assume alive
+            return code.value == _STILL_ACTIVE
+        except Exception:
+            return True
+
+    _ALREADY_DEBUGGED = (
+        "Could not attach as debugger — another debugger is already attached "
+        "to this process. Is Cheat Engine's debug mode active on it? Close it "
+        "and try again. (Windows allows only one debugger per process.)")
+
+    def _attach_error_text(self, err):
+        if err == ERROR_ACCESS_DENIED:
+            return (self._ALREADY_DEBUGGED + " If no other debugger is "
+                    "running, try starting GGMod as administrator.")
+        if err == ERROR_NOT_SUPPORTED:
+            return ("Could not attach as debugger: not supported for this "
+                    "process (32/64-bit mismatch or a protected process).")
+        if err == ERROR_INVALID_PARAMETER:
+            # Windows returns ERROR_INVALID_PARAMETER both when the pid does
+            # not exist AND when the process is already being debugged, so the
+            # code alone cannot tell them apart -- ask the process itself.
+            if self._process_alive():
+                return self._ALREADY_DEBUGGED
+            return ("Could not attach as debugger: the process is no longer "
+                    "running.")
+        return "Could not attach as debugger (Win32 error {}).".format(err)
+
+    def _iter_thread_ids(self):
+        snap = _kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+        if not snap or snap == _INVALID_HANDLE_VALUE:
+            return []
+        ids = []
+        try:
+            entry = THREADENTRY32()
+            entry.dwSize = ctypes.sizeof(THREADENTRY32)
+            ok = _kernel32.Thread32First(snap, ctypes.byref(entry))
+            while ok:
+                if entry.th32OwnerProcessID == self._pid:
+                    ids.append(entry.th32ThreadID)
+                ok = _kernel32.Thread32Next(snap, ctypes.byref(entry))
+        finally:
+            _kernel32.CloseHandle(snap)
+        return ids
+
+    def _apply_dr(self, tid, address, dr7):
+        """Set (or clear, with address=0/dr7=0) the slot-0 debug register on
+        one thread. Returns True on success. Suspends the thread around the
+        context swap, which is required for a reliable SetThreadContext."""
+        handle = _kernel32.OpenThread(_THREAD_BP_ACCESS, False, tid)
+        if not handle:
+            return False
+        try:
+            if _kernel32.SuspendThread(handle) == 0xFFFFFFFF:
+                return False
+            try:
+                use_wow64 = (not self._is64) and _HAVE_WOW64_CTX
+                if use_wow64:
+                    ctx = WOW64_CONTEXT()
+                    ctx.ContextFlags = CONTEXT_X86_DEBUG
+                    if not _kernel32.Wow64GetThreadContext(
+                            handle, ctypes.byref(ctx)):
+                        return False
+                    ctx.Dr0 = address & 0xFFFFFFFF
+                    ctx.Dr6 = 0
+                    ctx.Dr7 = dr7 & 0xFFFFFFFF
+                    ctx.ContextFlags = CONTEXT_X86_DEBUG
+                    return bool(_kernel32.Wow64SetThreadContext(
+                        handle, ctypes.byref(ctx)))
+                _raw, ctx = _alloc_context64()
+                ctx.ContextFlags = CONTEXT_AMD64_DEBUG
+                if not _kernel32.GetThreadContext(handle,
+                                                  ctypes.byref(ctx)):
+                    return False
+                ctx.Dr0 = address
+                ctx.Dr6 = 0
+                ctx.Dr7 = dr7
+                ctx.ContextFlags = CONTEXT_AMD64_DEBUG
+                return bool(_kernel32.SetThreadContext(handle,
+                                                       ctypes.byref(ctx)))
+            finally:
+                _kernel32.ResumeThread(handle)
+        finally:
+            _kernel32.CloseHandle(handle)
+
+    def _set_breakpoints(self):
+        """Arm the write-watchpoint on every current thread. A write can come
+        from any thread, so all of them get it; newly created threads are armed
+        as their CREATE_THREAD_DEBUG_EVENT arrives."""
+        dr7 = _dr7_for(self._SLOT, self._size)
+        if not dr7:
+            raise DebugAttachError(0, "Unsupported watch size {}.".format(
+                self._size))
+        armed = 0
+        for tid in self._iter_thread_ids():
+            if self._apply_dr(tid, self._address, dr7):
+                self._armed.add(tid)
+                armed += 1
+        self._log("Armed write-watchpoint at {:#x} ({} byte(s)) on {} "
+                  "thread(s).".format(self._address, self._size, armed))
+        return armed
+
+    def _clear_breakpoints(self):
+        """Disarm slot 0 everywhere. Runs before DebugActiveProcessStop --
+        a breakpoint left armed once the debugger detaches raises an exception
+        with nobody to handle it and crashes the game."""
+        cleared = 0
+        # Re-enumerate rather than trusting self._armed: threads may have been
+        # created (and armed) after the initial pass.
+        for tid in set(self._iter_thread_ids()) | set(self._armed):
+            if self._apply_dr(tid, 0, 0):
+                cleared += 1
+        self._armed.clear()
+        if cleared:
+            self._log("Cleared write-watchpoint on {} thread(s).".format(cleared))
+        return cleared
+
+    def _drain_pending(self, budget=3.0, wait_ms=60):
+        """Continue every debug event still queued, until none is pending.
+
+        This is a correctness requirement, not a tidy-up: a trap that fired
+        while we were not pumping stays STOPPED in the kernel, and
+        DebugActiveProcessStop delivers any un-continued exception to the app
+        as unhandled -- a STATUS_SINGLE_STEP with no handler terminates the
+        game. Draining with DBG_CONTINUE first is what makes detach safe.
+        Only safe to call once the breakpoints are disarmed, otherwise new
+        traps keep arriving and this never finishes.
+        """
+        evt = DEBUG_EVENT()
+        deadline = time.time() + budget
+        drained = 0
+        while time.time() < deadline:
+            if not _kernel32.WaitForDebugEvent(ctypes.byref(evt), wait_ms):
+                break                      # timed out => queue is empty
+            status = DBG_CONTINUE
+            if evt.dwDebugEventCode == EXCEPTION_DEBUG_EVENT:
+                code = (evt.u.Exception.ExceptionRecord.ExceptionCode
+                        & 0xFFFFFFFF)
+                # Swallow our own traps; hand anything else back to the game.
+                if code not in (EXCEPTION_SINGLE_STEP, EXCEPTION_BREAKPOINT):
+                    status = DBG_EXCEPTION_NOT_HANDLED
+            exiting = evt.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT
+            _kernel32.ContinueDebugEvent(evt.dwProcessId, evt.dwThreadId,
+                                         status)
+            drained += 1
+            if exiting:
+                self._attached = False     # nothing left to detach from
+                break
+        return drained
+
+    def _safe_cleanup(self):
+        """Idempotent teardown: disarm, flush pending traps, then detach.
+
+        Order matters. Disarm first so no new traps can be generated, then
+        drain what already fired, and only then stop debugging -- detaching
+        with a trap still pending crashes the game.
+        """
+        try:
+            if self._attached:
+                self._clear_breakpoints()
+                self._drain_pending()
+        except Exception as exc:
+            self._log("Error clearing breakpoints: {}".format(exc))
+        try:
+            if self._attached:
+                if _kernel32.DebugActiveProcessStop(self._pid):
+                    self._log("Debugger detached from pid {}.".format(self._pid))
+                else:
+                    self._log("DebugActiveProcessStop failed ({}).".format(
+                        ctypes.get_last_error()))
+        except Exception as exc:
+            self._log("Error detaching debugger: {}".format(exc))
+        finally:
+            self._attached = False
+
+    def _loop(self):
+        """WaitForDebugEvent / ContinueDebugEvent pump.
+
+        Uses a short timeout so the stop flag is honoured promptly. Every event
+        MUST be continued, otherwise the game stays frozen -- so the continue
+        status is decided per event and always sent.
+        """
+        evt = DEBUG_EVENT()
+        while not self._stop.is_set():
+            if not _kernel32.WaitForDebugEvent(ctypes.byref(evt), self._WAIT_MS):
+                err = ctypes.get_last_error()
+                if err == ERROR_SEM_TIMEOUT:
+                    continue                      # nothing happened; poll stop
+                self._log("WaitForDebugEvent failed ({}).".format(err))
+                break
+
+            status = DBG_CONTINUE
+            code = evt.dwDebugEventCode
+
+            if code == EXCEPTION_DEBUG_EVENT:
+                status = self._on_exception(evt)
+            elif code == CREATE_THREAD_DEBUG_EVENT:
+                # A brand-new thread starts with empty debug registers, so it
+                # would silently miss writes unless we arm it too.
+                dr7 = _dr7_for(self._SLOT, self._size)
+                if self._apply_dr(evt.dwThreadId, self._address, dr7):
+                    self._armed.add(evt.dwThreadId)
+            elif code == EXIT_THREAD_DEBUG_EVENT:
+                self._armed.discard(evt.dwThreadId)
+            elif code == EXIT_PROCESS_DEBUG_EVENT:
+                self._log("Target process exited; stopping watch session.")
+                _kernel32.ContinueDebugEvent(evt.dwProcessId, evt.dwThreadId,
+                                             DBG_CONTINUE)
+                self._attached = False   # nothing left to detach from
+                break
+
+            if not _kernel32.ContinueDebugEvent(evt.dwProcessId,
+                                                evt.dwThreadId, status):
+                self._log("ContinueDebugEvent failed ({}).".format(
+                    ctypes.get_last_error()))
+                break
+
+    def _on_exception(self, evt):
+        """Classify a first-chance exception. Returns the continue status.
+
+        Only OUR data breakpoint is swallowed (DBG_CONTINUE). Everything else
+        is handed back to the game (DBG_EXCEPTION_NOT_HANDLED) so its own
+        exception handling keeps working exactly as it would unattached.
+        """
+        rec = evt.u.Exception.ExceptionRecord
+        code = rec.ExceptionCode & 0xFFFFFFFF
+
+        if code == EXCEPTION_SINGLE_STEP:
+            try:
+                self._record_hit(evt.dwThreadId)
+            except Exception as exc:
+                self._log("Error recording hit: {}".format(exc))
+            return DBG_CONTINUE
+        if code == EXCEPTION_BREAKPOINT:
+            # The int3 Windows injects into the target when a debugger
+            # attaches. Ours to swallow; passing it on would crash the game.
+            return DBG_CONTINUE
+        return DBG_EXCEPTION_NOT_HANDLED
+
+    def _read_ip(self, tid):
+        """Return the trapping thread's instruction pointer, or None."""
+        handle = _kernel32.OpenThread(_THREAD_BP_ACCESS, False, tid)
+        if not handle:
+            return None
+        try:
+            if (not self._is64) and _HAVE_WOW64_CTX:
+                ctx = WOW64_CONTEXT()
+                ctx.ContextFlags = CONTEXT_X86_DEBUG
+                if not _kernel32.Wow64GetThreadContext(handle,
+                                                       ctypes.byref(ctx)):
+                    return None
+                return int(ctx.Eip)
+            _raw, ctx = _alloc_context64()
+            ctx.ContextFlags = CONTEXT_AMD64_DEBUG
+            if not _kernel32.GetThreadContext(handle, ctypes.byref(ctx)):
+                return None
+            return int(ctx.Rip)
+        finally:
+            _kernel32.CloseHandle(handle)
+
+    def _resolve_writer(self, next_ip):
+        """Find the instruction that performed the write.
+
+        A data breakpoint traps AFTER the storing instruction retires, so the
+        reported IP is the address of the NEXT instruction. x86 can't be
+        disassembled backwards directly, so anchor a few bytes earlier and
+        disassemble forward; whichever anchor produces an instruction stream
+        landing exactly on next_ip identifies the real instruction boundary.
+        Prefer the farthest-back anchor that lands cleanly -- the longer the
+        validated stream, the less likely it decoded mid-instruction garbage.
+
+        Returns (address, text, bytes_hex) for the writer, or None.
+        """
+        window = 24
+        start = next_ip - window
+        blob = self.engine._read(start, window)
+        if not blob:
+            return None
+        md = self.engine._make_disassembler(self._is64)
+        best = None
+        for back in range(window, 1, -1):
+            anchor = next_ip - back
+            offset = anchor - start
+            stream = list(md.disasm(bytes(blob[offset:]), anchor))
+            if not stream:
+                continue
+            last = None
+            for insn in stream:
+                if insn.address >= next_ip:
+                    break
+                last = insn
+            if last is not None and last.address + last.size == next_ip:
+                best = last
+                break                       # farthest-back clean landing wins
+        if best is None:
+            return None
+        return (best.address,
+                "{} {}".format(best.mnemonic, best.op_str).strip(),
+                bytes(best.bytes).hex(" ").upper())
+
+    def _record_hit(self, tid):
+        """Turn a trap into a report and push it onto the thread-safe queue.
+
+        Never touches the UI -- the UI drains `hits` on its own timer.
+        """
+        next_ip = self._read_ip(tid)
+        if next_ip is None:
+            return
+        resolved = self._resolve_writer(next_ip)
+        if resolved:
+            ip, text, raw = resolved
+        else:
+            # Fall back to reporting the trap site itself rather than dropping
+            # the hit; the user still gets a usable address to inspect.
+            ip, text, raw = next_ip, "(could not decode writing instruction)", ""
+        module, _base, _size = self.engine._module_for_address(ip)
+        self._hit_no += 1
+        self._counts[ip] = self._counts.get(ip, 0) + 1
+        if self.hits.qsize() < self._MAX_HITS:
+            self.hits.put({
+                "n": self._hit_no,
+                "time": time.strftime("%H:%M:%S"),
+                "address": "0x{:X}".format(ip),
+                "address_int": ip,
+                "next_ip": "0x{:X}".format(next_ip),
+                "module": module or "main exe",
+                "text": text,
+                "bytes": raw,
+                "count": self._counts[ip],
+                "thread": tid,
+            })

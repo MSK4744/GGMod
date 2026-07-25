@@ -18,7 +18,7 @@ import sys
 import threading
 
 import engine  # for the capstone-backed steal exceptions (Insufficient/Mid)
-from engine import MemoryScanner
+from engine import DebugSession, MemoryScanner
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 
@@ -86,6 +86,11 @@ class GGModUI:
         self.hotkeys = hotkeys
         # In-app value scanner (CE-style find tool); read/find only.
         self.scanner = MemoryScanner(engine)
+        # Hardware-breakpoint "what writes to this address" session. Idle until
+        # the user explicitly starts a watch -- it makes GGMod the game's
+        # debugger, so it must never run in the background. self.log is passed
+        # so debugger lifecycle events surface in the main log.
+        self.debugger = DebugSession(engine, log_callback=self.log)
 
         self.config_path = None       # path to the loaded JSON
         self.config_raw = {}          # full parsed config (so we can re-save)
@@ -384,6 +389,7 @@ class GGModUI:
         self._right_panel = right     # widened to full window in scanner mode
         self._right_default_width = 460
         self._scanner_fullwindow = False
+        self._fullwin_owner = None    # tab index that turned full-window on
 
         self.notebook = ttk.Notebook(right)
         self.notebook.pack(fill=tk.BOTH, expand=True)
@@ -391,6 +397,7 @@ class GGModUI:
         self._build_details_tab()
         self._build_add_tab()
         self._build_scanner_tab()
+        self._build_findwrites_tab()
         # Leaving the Value Scanner tab exits its full-window mode.
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
@@ -658,6 +665,324 @@ class GGModUI:
 
         self._sync_scan_value_state()
 
+    # ==================================================================
+    # Find Writes tab -- hardware-breakpoint "what writes to this address"
+    # ==================================================================
+    # Follows the Value Scanner's layout conventions: a PanedWindow with the
+    # results list on the left (stretches) and a scrollable controls column on
+    # the right. Unlike every other tab, this one drives a real Windows
+    # DEBUGGER on the target (engine.DebugSession), so the session lifecycle is
+    # explicit and always torn down -- see _stop_watch / on_detach / on_close.
+    _FW_POLL_MS = 200        # how often the UI drains the hit queue
+
+    def _build_findwrites_tab(self):
+        tab = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(tab, text="Find Writes")
+
+        header = tk.Frame(tab, bg=BG)
+        header.pack(fill=tk.X, padx=8, pady=(8, 2))
+        self._label(header, "Find What Writes to an Address", fg=ACCENT,
+                    font=(FONT, 11, "bold")).pack(side=tk.LEFT)
+        self._fw_fullwin_btn = self._button_ghost(
+            header, "⤢ Full window", self._toggle_fw_fullwindow)
+        self._fw_fullwin_btn.pack(side=tk.RIGHT)
+
+        body = tk.PanedWindow(
+            tab, orient=tk.HORIZONTAL, bg=BORDER, sashwidth=7,
+            sashrelief=tk.RAISED, bd=0, showhandle=True, handlesize=9,
+            handlepad=40, opaqueresize=True)
+        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 8))
+
+        # ---- RIGHT pane: scrollable controls column (same pattern as the
+        # scanner's, so the lower controls stay reachable at any window size).
+        ctl_outer = tk.Frame(body, bg=BG)
+        ctl_canvas = tk.Canvas(ctl_outer, bg=BG, highlightthickness=0, bd=0)
+        self._fw_ctrl_canvas = ctl_canvas
+        ctl_sb = tk.Scrollbar(ctl_outer, orient=tk.VERTICAL,
+                              command=ctl_canvas.yview)
+        ctl_canvas.configure(yscrollcommand=ctl_sb.set)
+        ctl_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        ctl_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        controls = tk.Frame(ctl_canvas, bg=BG)
+        ctl_win = ctl_canvas.create_window((0, 0), window=controls, anchor="nw")
+        controls.bind("<Configure>", lambda _e: ctl_canvas.configure(
+            scrollregion=ctl_canvas.bbox("all")))
+        ctl_canvas.bind("<Configure>",
+                        lambda e: ctl_canvas.itemconfigure(ctl_win, width=e.width))
+
+        def _wheel(e):
+            ctl_canvas.yview_scroll(int(-e.delta / 40), "units")
+        ctl_canvas.bind("<Enter>",
+                        lambda _e: ctl_canvas.bind_all("<MouseWheel>", _wheel))
+        ctl_canvas.bind("<Leave>",
+                        lambda _e: ctl_canvas.unbind_all("<MouseWheel>"))
+
+        grid = tk.Frame(controls, bg=BG)
+        grid.pack(fill=tk.X, pady=(0, 6))
+        grid.columnconfigure(1, weight=1)
+        self._label(grid, "Address:", fg=MUTED, width=8, anchor="w").grid(
+            row=0, column=0, sticky="w", pady=3)
+        self.fw_address = tk.StringVar()
+        self._entry(grid, self.fw_address, width=14).grid(
+            row=0, column=1, sticky="ew")
+        self._label(grid, "Size:", fg=MUTED, width=8, anchor="w").grid(
+            row=1, column=0, sticky="w", pady=3)
+        self.fw_size = tk.StringVar(value="4 Bytes")
+        ttk.Combobox(grid, textvariable=self.fw_size, state="readonly", width=10,
+                     values=["1 Byte", "2 Bytes", "4 Bytes", "8 Bytes"]).grid(
+            row=1, column=1, sticky="ew")
+
+        btns = tk.Frame(controls, bg=BG)
+        btns.pack(fill=tk.X, pady=(2, 2))
+        btns.columnconfigure(0, weight=1)
+        self.fw_start_btn = self._button(btns, "Start Watching",
+                                         self.on_start_watch)
+        self.fw_start_btn.grid(row=0, column=0, sticky="ew", pady=2)
+        self.fw_stop_btn = self._button_ghost(btns, "Stop Watching",
+                                              self.on_stop_watch)
+        self.fw_stop_btn.grid(row=1, column=0, sticky="ew", pady=2)
+        self.fw_stop_btn.config(state=tk.DISABLED)
+        self._button_ghost(btns, "Clear hits", self._clear_fw_hits).grid(
+            row=2, column=0, sticky="ew", pady=2)
+
+        self.fw_auto_open = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            controls, text="Auto-open Add Mod on first hit",
+            variable=self.fw_auto_open, bg=BG, fg=FG, selectcolor=BG3,
+            activebackground=BG, activeforeground=FG, anchor="w",
+            wraplength=self._SCAN_CTRL_WIDTH - 20, justify="left",
+            font=(FONT, 9)).pack(fill=tk.X, pady=(4, 0))
+
+        self.fw_status = tk.StringVar(value="Not watching.")
+        self._label(controls, "", fg=MUTED, textvariable=self.fw_status,
+                    wraplength=self._SCAN_CTRL_WIDTH - 8, justify="left",
+                    anchor="w").pack(fill=tk.X, pady=(6, 2))
+
+        self._label(
+            controls,
+            "Uses a hardware breakpoint, which makes GGMod the game's "
+            "debugger. Only one debugger can attach at a time, so close "
+            "Cheat Engine's debug mode on this process first. The session "
+            "stops automatically on Detach or exit.",
+            fg=MUTED, font=(FONT, 8),
+            wraplength=self._SCAN_CTRL_WIDTH - 8, justify="left",
+            anchor="w").pack(fill=tk.X, pady=(6, 0))
+
+        # ---- LEFT pane: captured hits ---------------------------------
+        results = tk.Frame(body, bg=BG)
+        self._label(
+            results, "Each row is one instruction that wrote to the address. "
+            "Double-click a row (or Send) to build a hook from it.",
+            fg=MUTED, font=(FONT, 8), justify="left", anchor="w"
+        ).pack(fill=tk.X, pady=(0, 4))
+
+        list_frame = tk.Frame(results, bg=BG)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+        fsb = tk.Scrollbar(list_frame)
+        fsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.fw_tree = ttk.Treeview(
+            list_frame,
+            columns=("hits", "time", "address", "module", "insn", "send"),
+            show="headings", height=12, yscrollcommand=fsb.set)
+        for key, text, width, minw in (
+            ("hits", "Hits", 50, 40), ("time", "Last", 70, 60),
+            ("address", "Instruction", 130, 100), ("module", "Module", 120, 70),
+            ("insn", "Decoded", 240, 120), ("send", "", 110, 110),
+        ):
+            self.fw_tree.heading(key, text=text, anchor="w")
+            self.fw_tree.column(key, width=width, minwidth=minw, anchor="w",
+                                stretch=(key == "insn"))
+        self.fw_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        fsb.config(command=self.fw_tree.yview)
+        self.fw_tree.bind("<Button-1>", self._on_fw_click)
+        self.fw_tree.bind("<Double-1>", self._on_fw_double_click)
+
+        body.add(results, stretch="always", minsize=200)
+        body.add(ctl_outer, stretch="never", minsize=230,
+                 width=self._SCAN_CTRL_WIDTH)
+
+        # Session state. _fw_rows maps instruction address -> hit payload so
+        # repeat writes from the same instruction update one row (CE-style)
+        # instead of flooding the list.
+        self._fw_rows = {}
+        self._fw_poll_job = None
+        self._fw_auto_fired = False
+
+    # ---- Find Writes: session control ---------------------------------
+    def on_start_watch(self):
+        """Begin a debug session watching the entered address for writes."""
+        if not self.engine.is_attached():
+            self.fw_status.set("Attach to a game first.")
+            return
+        if self.debugger.is_running():
+            self.fw_status.set("Already watching — stop the current session first.")
+            return
+        raw = self.fw_address.get().strip()
+        try:
+            address = int(raw, 16)        # hex by convention, like CE
+        except (TypeError, ValueError):
+            self.fw_status.set("Enter a valid hex address (e.g. 16BBAE38).")
+            return
+        size = {"1 Byte": 1, "2 Bytes": 2, "4 Bytes": 4,
+                "8 Bytes": 8}.get(self.fw_size.get(), 4)
+
+        self._clear_fw_hits()
+        self._fw_auto_fired = False
+        self.fw_status.set("Attaching debugger…")
+        self.root.update_idletasks()
+
+        res = self.debugger.start(address, size)
+        if "error" in res:
+            self.fw_status.set(res["error"])
+            self.log("Find Writes: {}".format(res["error"]))
+            return
+        used = res.get("size", size)
+        note = "" if used == size else \
+            " (size reduced to {} for address alignment)".format(used)
+        self.fw_status.set(
+            "Watching 0x{:X} on {} thread(s){} — play the game so the value "
+            "changes.".format(address, res.get("threads", 0), note))
+        self.log("Find Writes: watching 0x{:X} ({} byte(s)).".format(address, used))
+        self.fw_start_btn.config(state=tk.DISABLED)
+        self.fw_stop_btn.config(state=tk.NORMAL)
+        self._schedule_fw_poll()
+
+    def on_stop_watch(self):
+        self._stop_watch(reason="Stopped watching.")
+
+    def _stop_watch(self, reason="Stopped watching."):
+        """Tear the debug session down. Safe to call when nothing is running,
+        so detach/close paths can call it unconditionally."""
+        if self._fw_poll_job is not None:
+            try:
+                self.root.after_cancel(self._fw_poll_job)
+            except Exception:
+                pass
+            self._fw_poll_job = None
+        running = self.debugger.is_running()
+        res = self.debugger.stop()
+        if running:
+            self.log("Find Writes: session stopped; debugger detached.")
+        if hasattr(self, "fw_start_btn"):
+            self.fw_start_btn.config(state=tk.NORMAL)
+            self.fw_stop_btn.config(state=tk.DISABLED)
+            if "error" in res:
+                self.fw_status.set(res["error"])
+            elif running:
+                self.fw_status.set(reason)
+        return res
+
+    def _clear_fw_hits(self):
+        self._fw_rows = {}
+        if hasattr(self, "fw_tree"):
+            self.fw_tree.delete(*self.fw_tree.get_children())
+
+    def _schedule_fw_poll(self):
+        self._fw_poll_job = self.root.after(self._FW_POLL_MS, self._poll_fw_hits)
+
+    def _poll_fw_hits(self):
+        """Drain the debug thread's hit queue on the UI thread.
+
+        The debug loop never touches tkinter; it only puts dicts on a
+        queue.Queue, and this is the single place they become widgets.
+        """
+        self._fw_poll_job = None
+        drained = 0
+        while True:
+            try:
+                hit = self.debugger.hits.get_nowait()
+            except Exception:
+                break
+            self._apply_fw_hit(hit)
+            drained += 1
+            if drained >= 200:            # keep the UI responsive under spam
+                break
+
+        if self.debugger.is_running():
+            if drained:
+                total = sum(r["count"] for r in self._fw_rows.values())
+                self.fw_status.set(
+                    "Watching — {} write(s) from {} instruction(s).".format(
+                        total, len(self._fw_rows)))
+            self._schedule_fw_poll()
+        else:
+            # The session ended on its own (e.g. the game exited).
+            self.fw_start_btn.config(state=tk.NORMAL)
+            self.fw_stop_btn.config(state=tk.DISABLED)
+
+    def _apply_fw_hit(self, hit):
+        """Upsert one hit, keyed by the writing instruction address.
+
+        Repeat writes from the same instruction bump its count rather than
+        adding rows — the interesting signal is WHICH instructions write, and
+        how often, not thousands of individual traps.
+        """
+        key = hit["address"]
+        known = self._fw_rows.get(key)
+        if known is None:
+            self._fw_rows[key] = hit
+            self.fw_tree.insert(
+                "", "end", iid=key,
+                values=(hit["count"], hit["time"], hit["address"],
+                        hit["module"], hit["text"], "→ Send"))
+        else:
+            known["count"] = hit["count"]
+            known["time"] = hit["time"]
+            if self.fw_tree.exists(key):
+                self.fw_tree.set(key, "hits", hit["count"])
+                self.fw_tree.set(key, "time", hit["time"])
+
+        # Full automation: the first captured write goes straight into the
+        # Add Mod flow. The session is stopped first -- the dialog is modal, so
+        # leaving a debugger attached behind it would strand the game with no
+        # reachable Stop button.
+        if not self._fw_auto_fired and self.fw_auto_open.get():
+            self._fw_auto_fired = True
+            self._stop_watch(reason="Stopped — first hit sent to Add Mod.")
+            self._send_address_to_add_mod(hit["address"], auto_read=True)
+
+    def _fw_selected_address(self, event=None):
+        if event is not None:
+            if self.fw_tree.identify("region", event.x, event.y) != "cell":
+                return None
+            row = self.fw_tree.identify_row(event.y)
+            return row or None
+        sel = self.fw_tree.selection()
+        return sel[0] if sel else None
+
+    def _on_fw_click(self, event):
+        """Clicking the Send cell pushes that specific instruction into Add
+        Mod — important when several different code paths write the same
+        address and the user needs a particular one, not just the first."""
+        if self.fw_tree.identify("region", event.x, event.y) != "cell":
+            return
+        cols = self.fw_tree["columns"]
+        col_id = self.fw_tree.identify_column(event.x)
+        idx = int(col_id[1:]) - 1 if col_id.startswith("#") else -1
+        if idx < 0 or idx >= len(cols) or cols[idx] != "send":
+            return
+        wid = self.fw_tree.identify_row(event.y)
+        if wid:
+            self._send_fw_address(wid)
+
+    def _on_fw_double_click(self, event):
+        wid = self._fw_selected_address(event)
+        if wid:
+            self._send_fw_address(wid)
+
+    def _send_fw_address(self, key):
+        """Send one captured instruction address into the Add Mod flow.
+
+        Stops the watch session first for the same modal-dialog reason as the
+        auto-open path above.
+        """
+        hit = self._fw_rows.get(key)
+        if hit is None:
+            return
+        if self.debugger.is_running():
+            self._stop_watch(reason="Stopped — address sent to Add Mod.")
+        self._send_address_to_add_mod(hit["address"], auto_read=True)
+
     # ---- Watch List: CE-style saved-address panel ------------------------
     def _build_watchlist_panel(self, tab):
         frame = tk.Frame(tab, bg=BG)
@@ -847,14 +1172,15 @@ class GGModUI:
         self.watch_tree.set(wid, "value", display)
         self.scan_status.set("Set {} = {}.".format(row["address_str"], display))
 
-    def _use_watch_in_add_mod(self, wid):
-        """'Use in Add Mod': switch to the Add Mod tab and open the same
-        'From address...' dialog a hook row already offers, pre-filled with
-        this watched address. Pure navigation + pre-fill -- does not touch
-        build_candidate_from_address or any of its matching/auto-fill logic."""
-        row = self._watch_rows.get(wid)
-        if row is None:
-            return
+    def _send_address_to_add_mod(self, address_str, auto_read=False):
+        """Shared 'take this address into Add Mod' navigation.
+
+        Used by BOTH the Watch List's "-> Add Mod" button and Find Writes'
+        "Send this address", so the two never drift apart. Switches to the Add
+        Mod tab and opens the same "From address..." dialog a hook row already
+        offers, pre-filled. Pure navigation + pre-fill -- it does not touch
+        build_candidate_from_address or any of its matching/auto-fill logic.
+        """
         self.notebook.select(1)   # Add Mod tab (0=Selected Mod, 2=Value Scanner)
         # Hook rows -- and therefore "From address..." -- only exist for the
         # pointer_capture template. Switching template only toggles which form
@@ -864,7 +1190,15 @@ class GGModUI:
             self._refresh_form_fields()   # seeds one empty hook row
         if not self._hook_entries:
             self._add_hook_row()
-        self._from_address(self._hook_entries[0], prefill_address=row["address_str"])
+        self._from_address(self._hook_entries[0], prefill_address=address_str,
+                           auto_read=auto_read)
+
+    def _use_watch_in_add_mod(self, wid):
+        """'Use in Add Mod' on a Watch List row."""
+        row = self._watch_rows.get(wid)
+        if row is None:
+            return
+        self._send_address_to_add_mod(row["address_str"])
 
     def _remove_watch_row(self, wid):
         self._watch_rows.pop(wid, None)
@@ -1171,24 +1505,42 @@ class GGModUI:
         self.root.clipboard_append(address)
         self.scan_status.set("Copied {} to clipboard.".format(address))
 
-    def _toggle_scanner_fullwindow(self):
-        """Hide/show the left mod list so the scanner fills the whole window."""
+    def _toggle_fullwindow(self, owner_tab, button):
+        """Hide/show the left mod list so the owning tab fills the window.
+
+        Shared by the Value Scanner and Find Writes tabs -- both have wide
+        results tables that are cramped inside the fixed-width right panel.
+        `owner_tab` records which tab turned it on so _on_tab_changed knows to
+        restore the mod list when the user navigates away.
+        """
         self._scanner_fullwindow = not self._scanner_fullwindow
         if self._scanner_fullwindow:
+            self._fullwin_owner = owner_tab
             self._left_panel.pack_forget()
             self._right_panel.pack_configure(expand=True, padx=0)
-            self._fullwin_btn.config(text="⤢ Exit full window")
+            button.config(text="⤢ Exit full window")
         else:
+            self._fullwin_owner = None
             self._right_panel.pack_configure(expand=False, padx=(12, 0))
             self._left_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
                                   before=self._right_panel)
-            self._fullwin_btn.config(text="⤢ Full window")
+            button.config(text="⤢ Full window")
+
+    def _toggle_scanner_fullwindow(self):
+        self._toggle_fullwindow(2, self._fullwin_btn)
+
+    def _toggle_fw_fullwindow(self):
+        self._toggle_fullwindow(3, self._fw_fullwin_btn)
 
     def _on_tab_changed(self, _event=None):
-        # Auto-exit full-window mode when the user switches away from the
-        # Value Scanner tab (index 2), so other tabs keep the mod list.
-        if self._scanner_fullwindow and self.notebook.index("current") != 2:
-            self._toggle_scanner_fullwindow()
+        # Auto-exit full-window mode when the user leaves the tab that turned
+        # it on, so every other tab keeps the mod list.
+        if self._scanner_fullwindow and \
+                self.notebook.index("current") != self._fullwin_owner:
+            self._toggle_fullwindow(
+                self._fullwin_owner,
+                self._fw_fullwin_btn if self._fullwin_owner == 3
+                else self._fullwin_btn)
         # Entering the scanner arms live refresh; leaving it pauses the loop.
         self._update_scan_auto()
 
@@ -1603,7 +1955,7 @@ class GGModUI:
                 "region — double-check it disassembled correctly.".format(steal))
         self.log(msg)
 
-    def _from_address(self, entry, prefill_address=None):
+    def _from_address(self, entry, prefill_address=None, auto_read=False):
         """Dialog: read a live address, disassemble, and auto-fill the hook.
 
         Reuses engine.build_candidate_from_address (capstone + scan_aob). The
@@ -1612,7 +1964,10 @@ class GGModUI:
 
         `prefill_address` (e.g. from the Watch List's "Use in Add Mod") only
         fills the Address field -- it's a navigation convenience and does not
-        auto-run Read or change any matching/auto-fill behaviour below."""
+        change any matching/auto-fill behaviour below. `auto_read` additionally
+        presses Read for you (used by Find Writes, where the address came from
+        a captured hit so there is nothing for the user to type). Neither flag
+        auto-fills the form: "Fill fields" stays an explicit click."""
         self.form_error_var.set("")
         if not self.engine.is_attached():
             self.form_error_var.set(
@@ -1728,6 +2083,11 @@ class GGModUI:
         fill_btn.pack(side=tk.LEFT)
         fill_btn.config(state=tk.DISABLED)
         self._button_ghost(btns, "Cancel", top.destroy).pack(side=tk.LEFT, padx=(6, 0))
+
+        # Deferred so _read() runs against a fully built dialog (it enables
+        # fill_btn, which only exists once the lines above have executed).
+        if auto_read and prefill_address:
+            top.after(0, _read)
 
     def _paste_line(self, entry):
         """Offline dialog: paste a disassembly line, fill register + offset.
@@ -2121,6 +2481,11 @@ class GGModUI:
     def on_detach(self):
         if not self.engine.is_attached():
             return
+        # Kill any debug session FIRST: it holds a hardware breakpoint in the
+        # game's threads, and those must be cleared while the process handle is
+        # still valid. A debugger left attached past detach would freeze or
+        # crash the game.
+        self._stop_watch(reason="Stopped — detached from the game.")
         # Detach tears down all mods in the engine. Mod hotkey bindings are
         # config-scoped (registered at load), so we KEEP them: a press while
         # detached is safely ignored, and they work again on re-attach. Scan
@@ -3175,6 +3540,13 @@ class GGModUI:
     # ==================================================================
     def on_close(self):
         try:
+            # Before anything else: end any debug session. Closing GGMod with a
+            # hardware breakpoint still armed in the game's threads would leave
+            # it trapping into a debugger that no longer exists.
+            try:
+                self._stop_watch(reason="Stopped — GGMod closing.")
+            except Exception as exc:
+                self.log("Error stopping watch session on close: {}".format(exc))
             # Stop the live auto-refresh loop + any pending flash resets so no
             # timer fires against a destroyed window or detached process.
             if self._scan_auto_job is not None:
