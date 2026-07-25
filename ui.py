@@ -555,13 +555,15 @@ class GGModUI:
         self.scan_tree = ttk.Treeview(
             list_frame, columns=("value", "previous", "module"),
             show="tree headings", height=12, yscrollcommand=sb.set)
-        self.scan_tree.heading("#0", text="Address")
+        # Headings are left-anchored ("w") to match the left-anchored data
+        # cells, so each title sits directly above its own column of values.
+        self.scan_tree.heading("#0", text="Address", anchor="w")
         self.scan_tree.column("#0", width=150, minwidth=110, anchor="w")
-        self.scan_tree.heading("value", text="Value")
+        self.scan_tree.heading("value", text="Value", anchor="w")
         self.scan_tree.column("value", width=110, minwidth=60, anchor="w")
-        self.scan_tree.heading("previous", text="Previous")
+        self.scan_tree.heading("previous", text="Previous", anchor="w")
         self.scan_tree.column("previous", width=110, minwidth=60, anchor="w")
-        self.scan_tree.heading("module", text="Module")
+        self.scan_tree.heading("module", text="Module", anchor="w")
         self.scan_tree.column("module", width=120, minwidth=60, anchor="w")
         self.scan_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.config(command=self.scan_tree.yview)
