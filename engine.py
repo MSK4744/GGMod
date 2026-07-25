@@ -1774,14 +1774,17 @@ class MemoryScanner:
             return repr(value)
         return str(value)
 
-    def _row(self, addr, value):
+    def _row(self, addr, value, prev):
         return {"address": "0x{:X}".format(addr), "address_int": addr,
-                "value": self._fmt_value(value), "module": self._module_at(addr)}
+                "value": self._fmt_value(value),
+                "previous": self._fmt_value(prev),
+                "module": self._module_at(addr)}
 
     def _summary(self, truncated=False):
         return {
             "count": len(self.results),
-            "results": [self._row(a, v) for a, v in self.results[:self.PREVIEW_LIMIT]],
+            "results": [self._row(a, v, p)
+                        for a, v, p in self.results[:self.PREVIEW_LIMIT]],
             "truncated": bool(truncated) or len(self.results) > self.PREVIEW_LIMIT,
         }
 
@@ -1832,8 +1835,10 @@ class MemoryScanner:
                         start = idx - first_fixed
                         if start >= 0 and TrainerEngine._match_at(
                                 chunk, start, pattern, mask):
-                            results.append((base + coff + start,
-                                            bytes(chunk[start:start + plen])))
+                            found = bytes(chunk[start:start + plen])
+                            # (address, value, previous) — previous starts equal
+                            # to the found value, like CE's first scan.
+                            results.append((base + coff + start, found, found))
                             if len(results) >= self.MAX_COLLECT:
                                 truncated = True
                                 break
@@ -1852,7 +1857,7 @@ class MemoryScanner:
                         idx = chunk.find(needle, pos)
                         if idx < 0:
                             break
-                        results.append((base + coff + idx, v))
+                        results.append((base + coff + idx, v, v))
                         if len(results) >= self.MAX_COLLECT:
                             truncated = True
                             break
@@ -1875,7 +1880,7 @@ class MemoryScanner:
                 n = len(chunk) - (len(chunk) % size)
                 for o in range(0, n, size):
                     val = struct.unpack(fmt, chunk[o:o + size])[0]
-                    results.append((base + coff + o, val))
+                    results.append((base + coff + o, val, val))
                     if len(results) >= self.MAX_COLLECT:
                         truncated = True
                         break
@@ -1909,12 +1914,14 @@ class MemoryScanner:
 
         self._history.append(list(self.results))   # snapshot for undo
         new = []
-        for addr, prev in self.results:
+        for addr, value, _oldprev in self.results:
             cur = self._decode(self.engine._read(addr, size))
             if cur is None:
                 continue                            # unreadable now -> drop
-            if self._compare(scan_type, cur, prev, target):
-                new.append((addr, cur))
+            # Compare against the last-known value; on survival that value
+            # becomes the "previous" column so the user sees what it was.
+            if self._compare(scan_type, cur, value, target):
+                new.append((addr, cur, value))
         self.results = new
         return self._summary()
 
@@ -1950,8 +1957,8 @@ class MemoryScanner:
         limit = limit or self.PREVIEW_LIMIT
         fmt, size = self._fmt()
         rows = []
-        for addr, _prev in self.results[:limit]:
+        for addr, _value, prev in self.results[:limit]:
             cur = self._decode(self.engine._read(addr, size))
-            rows.append(self._row(addr, cur))
+            rows.append(self._row(addr, cur, prev))
         return {"count": len(self.results), "results": rows,
                 "truncated": len(self.results) > limit}

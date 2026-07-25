@@ -280,6 +280,7 @@ class GGModUI:
         # ---- Left: mod list + per-mod action buttons ----
         left = tk.Frame(main, bg=BG)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._left_panel = left       # hidden in Value Scanner full-window mode
 
         self._label(left, "Mods", fg=ACCENT, font=(FONT, 11, "bold")).pack(anchor="w")
 
@@ -373,6 +374,9 @@ class GGModUI:
         right = tk.Frame(main, bg=BG, width=460)
         right.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(12, 0))
         right.pack_propagate(False)
+        self._right_panel = right     # widened to full window in scanner mode
+        self._right_default_width = 460
+        self._scanner_fullwindow = False
 
         self.notebook = ttk.Notebook(right)
         self.notebook.pack(fill=tk.BOTH, expand=True)
@@ -380,6 +384,8 @@ class GGModUI:
         self._build_details_tab()
         self._build_add_tab()
         self._build_scanner_tab()
+        # Leaving the Value Scanner tab exits its full-window mode.
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
     # ---- Value Scanner tab (CE-style find tool) ---------------------
     _SCAN_VALUE_TYPE_LABELS = [
@@ -399,8 +405,15 @@ class GGModUI:
         tab = tk.Frame(self.notebook, bg=BG)
         self.notebook.add(tab, text="Value Scanner")
 
-        self._label(tab, "Memory Value Scanner", fg=ACCENT,
-                    font=(FONT, 11, "bold")).pack(anchor="w", padx=8, pady=(8, 2))
+        header = tk.Frame(tab, bg=BG)
+        header.pack(fill=tk.X, padx=8, pady=(8, 2))
+        self._label(header, "Memory Value Scanner", fg=ACCENT,
+                    font=(FONT, 11, "bold")).pack(side=tk.LEFT)
+        # Full-window toggle: hides the mod list so the scanner uses the whole
+        # window (a roomier results table). Auto-exits when leaving this tab.
+        self._fullwin_btn = self._button_ghost(
+            header, "⤢ Full window", self._toggle_scanner_fullwindow)
+        self._fullwin_btn.pack(side=tk.RIGHT)
         self._label(tab, "Find an address by value (read-only). Copy the address "
                     "into Add Mod → From address…", fg=MUTED, font=(FONT, 8),
                     wraplength=430, justify="left").pack(anchor="w", padx=8)
@@ -467,14 +480,16 @@ class GGModUI:
         sb = tk.Scrollbar(list_frame)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.scan_tree = ttk.Treeview(
-            list_frame, columns=("value", "module"), show="tree headings",
-            height=12, yscrollcommand=sb.set)
+            list_frame, columns=("value", "previous", "module"),
+            show="tree headings", height=12, yscrollcommand=sb.set)
         self.scan_tree.heading("#0", text="Address")
         self.scan_tree.column("#0", width=140, minwidth=110, anchor="w")
         self.scan_tree.heading("value", text="Value")
-        self.scan_tree.column("value", width=110, minwidth=70, anchor="w")
+        self.scan_tree.column("value", width=100, minwidth=60, anchor="w")
+        self.scan_tree.heading("previous", text="Previous")
+        self.scan_tree.column("previous", width=100, minwidth=60, anchor="w")
         self.scan_tree.heading("module", text="Module")
-        self.scan_tree.column("module", width=120, minwidth=60, anchor="w")
+        self.scan_tree.column("module", width=110, minwidth=60, anchor="w")
         self.scan_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.config(command=self.scan_tree.yview)
         # Double-click a row copies its address to the clipboard.
@@ -561,7 +576,7 @@ class GGModUI:
         self.scan_tree.delete(*self.scan_tree.get_children())
         for row in res.get("results", []):
             self.scan_tree.insert("", "end", text=row["address"],
-                                  values=(row["value"], row.get("module", "")))
+                                  values=(row["value"], row.get("previous", ""), row.get("module", "")))
         count = res.get("count", 0)
         msg = "{} result(s).".format(count)
         if res.get("truncated"):
@@ -631,7 +646,7 @@ class GGModUI:
         self.scan_tree.delete(*self.scan_tree.get_children())
         for row in res.get("results", []):
             self.scan_tree.insert("", "end", text=row["address"],
-                                  values=(row["value"], row.get("module", "")))
+                                  values=(row["value"], row.get("previous", ""), row.get("module", "")))
         self.scan_status.set("{} result(s) — values refreshed.".format(
             res.get("count", 0)))
 
@@ -643,6 +658,25 @@ class GGModUI:
         self.root.clipboard_clear()
         self.root.clipboard_append(address)
         self.scan_status.set("Copied {} to clipboard.".format(address))
+
+    def _toggle_scanner_fullwindow(self):
+        """Hide/show the left mod list so the scanner fills the whole window."""
+        self._scanner_fullwindow = not self._scanner_fullwindow
+        if self._scanner_fullwindow:
+            self._left_panel.pack_forget()
+            self._right_panel.pack_configure(expand=True, padx=0)
+            self._fullwin_btn.config(text="⤢ Exit full window")
+        else:
+            self._right_panel.pack_configure(expand=False, padx=(12, 0))
+            self._left_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
+                                  before=self._right_panel)
+            self._fullwin_btn.config(text="⤢ Full window")
+
+    def _on_tab_changed(self, _event=None):
+        # Auto-exit full-window mode when the user switches away from the
+        # Value Scanner tab (index 2), so other tabs keep the mod list.
+        if self._scanner_fullwindow and self.notebook.index("current") != 2:
+            self._toggle_scanner_fullwindow()
 
     # ---- Scan hotkeys: global, user-bindable, reuse HotkeyManager --------
     def _scan_key_conflict(self, key, exclude_action=None):
