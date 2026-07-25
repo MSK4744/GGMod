@@ -1962,3 +1962,38 @@ class MemoryScanner:
             rows.append(self._row(addr, cur, prev))
         return {"count": len(self.results), "results": rows,
                 "truncated": len(self.results) > limit}
+
+    # ---- Watch List support (arbitrary, manually-picked addresses) --------
+    # These read/write a single address directly, independent of self.results
+    # -- used by the UI's Watch List panel to keep a handful of user-picked
+    # addresses live and, optionally, frozen for address verification.
+    def read_value(self, address, value_type=None):
+        """Read one scalar at `address` for the given value-type key. Does not
+        touch or require self.results."""
+        if not self.engine.is_attached():
+            return None
+        fmt, size = self._fmt(value_type)
+        if fmt is None:          # aob has no fixed scalar shape to read here
+            return None
+        return self._decode(self.engine._read(address, size), value_type)
+
+    def write_value(self, address, value, value_type=None):
+        """Write one scalar to `address` for the given value-type key.
+
+        Reuses the engine's raw write primitive (engine._write -- the same
+        one force_set_value uses) rather than duplicating write logic. This
+        is a direct memory write only: no AOB scan, no code cave, no JMP --
+        it is NOT a mod. It exists so the Watch List's Freeze checkbox can
+        hold a manually-found address steady for verification, mirroring
+        Cheat Engine's Freeze, and must stay distinct from pointer_capture /
+        hard_freeze mods."""
+        if not self.engine.is_attached():
+            return False
+        fmt, _size = self._fmt(value_type)
+        if fmt is None:
+            return False
+        try:
+            self.engine._write(address, struct.pack(fmt, value))
+            return True
+        except Exception:
+            return False

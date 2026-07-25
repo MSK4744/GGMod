@@ -427,6 +427,14 @@ class GGModUI:
             header, "⤢ Full window", self._toggle_scanner_fullwindow)
         self._fullwin_btn.pack(side=tk.RIGHT)
 
+        # --- Watch List: CE-style saved-address panel, docked to the bottom of
+        # the tab. Packed with side=BOTTOM BEFORE the expanding body below, so
+        # it reliably claims its own space instead of being squeezed to zero.
+        self._watch_rows = {}    # wid -> {address, vtype_key/label, desc,
+                                 # active, frozen_value} -- session-only, never
+                                 # persisted (cleared on detach/New Scan/close).
+        self._build_watchlist_panel(tab)
+
         # --- Body: results table (LEFT, expands) + controls (RIGHT, fixed) --
         # Cheat-Engine arrangement in a draggable split: the results list is the
         # left pane, controls the right pane. The sash between them can be
@@ -587,8 +595,10 @@ class GGModUI:
         self.scan_tree.column("module", width=120, minwidth=60, anchor="w")
         self.scan_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.config(command=self.scan_tree.yview)
-        # Double-click a row copies its address to the clipboard.
-        self.scan_tree.bind("<Double-1>", self._copy_scan_address)
+        # Double-click a result row adds it to the Watch List below (CE-style
+        # "add to address list"). Copying still works via the dedicated
+        # "Copy selected address" button.
+        self.scan_tree.bind("<Double-1>", self._add_to_watchlist)
         # Flash colours for live-changed values (green=up, red=down, amber=other).
         self.scan_tree.tag_configure("flash_up",
                                      background="#14432a", foreground="#4ade80")
@@ -605,6 +615,174 @@ class GGModUI:
                  width=self._SCAN_CTRL_WIDTH)
 
         self._sync_scan_value_state()
+
+    # ---- Watch List: CE-style saved-address panel ------------------------
+    def _build_watchlist_panel(self, tab):
+        frame = tk.Frame(tab, bg=BG)
+        frame.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(4, 8))
+
+        whead = tk.Frame(frame, bg=BG)
+        whead.pack(fill=tk.X)
+        self._label(whead, "Watch List", fg=ACCENT,
+                    font=(FONT, 10, "bold")).pack(side=tk.LEFT)
+        self._label(
+            whead, "double-click a result above to add — Active = Freeze "
+                   "(repeated write, for address verification only)",
+            fg=MUTED, font=(FONT, 8)).pack(side=tk.LEFT, padx=(8, 0))
+        self._button_ghost(whead, "Clear Watch List",
+                           self._clear_watchlist).pack(side=tk.RIGHT)
+
+        list_frame = tk.Frame(frame, bg=BG)
+        list_frame.pack(fill=tk.X, pady=(4, 0))
+        wsb = tk.Scrollbar(list_frame)
+        wsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.watch_tree = ttk.Treeview(
+            list_frame,
+            columns=("active", "desc", "address", "type", "value", "remove"),
+            show="headings", height=5, yscrollcommand=wsb.set)
+        self.watch_tree.heading("active", text="Active", anchor="w")
+        self.watch_tree.column("active", width=55, minwidth=50, anchor="w",
+                               stretch=False)
+        self.watch_tree.heading("desc", text="Description", anchor="w")
+        self.watch_tree.column("desc", width=150, minwidth=80, anchor="w")
+        self.watch_tree.heading("address", text="Address", anchor="w")
+        self.watch_tree.column("address", width=110, minwidth=90, anchor="w")
+        self.watch_tree.heading("type", text="Type", anchor="w")
+        self.watch_tree.column("type", width=90, minwidth=70, anchor="w")
+        self.watch_tree.heading("value", text="Value", anchor="w")
+        self.watch_tree.column("value", width=90, minwidth=60, anchor="w")
+        self.watch_tree.heading("remove", text="", anchor="center")
+        self.watch_tree.column("remove", width=28, minwidth=28,
+                               anchor="center", stretch=False)
+        self.watch_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        wsb.config(command=self.watch_tree.yview)
+        self.watch_tree.bind("<Button-1>", self._on_watch_click)
+        # Tint a row while its Freeze is active, so it's visually distinct
+        # from a plain watched (non-frozen) row.
+        self.watch_tree.tag_configure(
+            "frozen", background="#4a1414", foreground="#f87171")
+
+    def _watch_column_at(self, event):
+        """Return (wid, column_name) for a <Button-1> on self.watch_tree, or
+        (None, None) if the click wasn't on a data cell."""
+        if self.watch_tree.identify("region", event.x, event.y) != "cell":
+            return None, None
+        wid = self.watch_tree.identify_row(event.y)
+        col_id = self.watch_tree.identify_column(event.x)
+        if not wid or not col_id.startswith("#"):
+            return None, None
+        cols = self.watch_tree["columns"]
+        idx = int(col_id[1:]) - 1
+        if idx < 0 or idx >= len(cols):
+            return None, None
+        return wid, cols[idx]
+
+    def _on_watch_click(self, event):
+        wid, col = self._watch_column_at(event)
+        if wid is None:
+            return
+        if col == "active":
+            self._toggle_watch_active(wid)
+        elif col == "desc":
+            self._edit_watch_desc(wid)
+        elif col == "remove":
+            self._remove_watch_row(wid)
+
+    def _add_to_watchlist(self, _event=None):
+        """Double-click handler on the main results table: copy the selected
+        address (+ its current value type) into the Watch List below, without
+        removing it from the results table. No duplicate rows per address."""
+        sel = self.scan_tree.selection()
+        if not sel:
+            return
+        addr_str = self.scan_tree.item(sel[0], "text")
+        try:
+            addr = int(addr_str, 16)
+        except (TypeError, ValueError):
+            return
+        if any(r["address"] == addr for r in self._watch_rows.values()):
+            self.scan_status.set(
+                "{} is already in the Watch List.".format(addr_str))
+            return
+        vtype_label = self.scan_vtype.get()
+        vtype_key = dict(self._SCAN_VALUE_TYPE_LABELS).get(
+            vtype_label, "4 bytes")
+        value_str = self.scan_tree.set(sel[0], "value")
+        wid = "w{:x}".format(addr)
+        self._watch_rows[wid] = {
+            "address": addr, "address_str": addr_str,
+            "vtype_key": vtype_key, "vtype_label": vtype_label,
+            "desc": "", "active": False, "frozen_value": None,
+        }
+        self.watch_tree.insert(
+            "", "end", iid=wid,
+            values=("☐", "", addr_str, vtype_label, value_str, "✕"))
+        self.scan_status.set("Added {} to Watch List.".format(addr_str))
+        self._update_scan_auto()   # the watch tick may now need to start
+
+    def _toggle_watch_active(self, wid):
+        """Active checkbox = Freeze. Turning it on captures the CURRENT live
+        value as the frozen target (re-written every tick); turning it off
+        simply stops writing and lets the game's own value resume."""
+        row = self._watch_rows.get(wid)
+        if row is None:
+            return
+        row["active"] = not row["active"]
+        if row["active"]:
+            cur = self.scanner.read_value(row["address"], row["vtype_key"])
+            row["frozen_value"] = cur
+            if cur is None:
+                self.scan_status.set(
+                    "Watch: couldn't read {} to freeze (not attached or "
+                    "unreadable address).".format(row["address_str"]))
+        else:
+            row["frozen_value"] = None
+        self.watch_tree.set(wid, "active", "☑" if row["active"] else "☐")
+        self.watch_tree.item(wid, tags=("frozen",) if row["active"] else ())
+        self._update_scan_auto()   # a newly-active row needs the tick running
+
+    def _edit_watch_desc(self, wid):
+        row = self._watch_rows.get(wid)
+        if row is None:
+            return
+        new_desc = simpledialog.askstring(
+            "Watch List", "Description for {}:".format(row["address_str"]),
+            initialvalue=row["desc"], parent=self.root)
+        if new_desc is None:
+            return
+        row["desc"] = new_desc.strip()
+        self.watch_tree.set(wid, "desc", row["desc"])
+
+    def _remove_watch_row(self, wid):
+        self._watch_rows.pop(wid, None)
+        if self.watch_tree.exists(wid):
+            self.watch_tree.delete(wid)
+        self._update_scan_auto()   # loop may no longer be needed
+
+    def _clear_watchlist(self):
+        """Drop every watched address (no writes are pending after this — any
+        row that was frozen simply stops being rewritten). Called on manual
+        Clear, New Scan, detach, and app close; the Watch List is session-only
+        and is never persisted to disk."""
+        self._watch_rows.clear()
+        if hasattr(self, "watch_tree"):
+            self.watch_tree.delete(*self.watch_tree.get_children())
+        self._update_scan_auto()
+
+    def _tick_watchlist(self):
+        """One tick's worth of Watch List work: write each active (frozen)
+        row's held value first, then read the live value for display -- so a
+        successful freeze shows the value holding steady, exactly like CE."""
+        for wid, row in list(self._watch_rows.items()):
+            if not self.watch_tree.exists(wid):
+                self._watch_rows.pop(wid, None)
+                continue
+            if row["active"] and row["frozen_value"] is not None:
+                self.scanner.write_value(
+                    row["address"], row["frozen_value"], row["vtype_key"])
+            cur = self.scanner.read_value(row["address"], row["vtype_key"])
+            display = self.scanner._fmt_value(cur) if cur is not None else "?"
+            self.watch_tree.set(wid, "value", display)
 
     # ---- Scan-hotkey settings persistence --------------------------------
     def _load_settings(self):
@@ -729,6 +907,7 @@ class GGModUI:
 
     def on_new_scan(self):
         self._render_scan(self.scanner.new_scan())
+        self._clear_watchlist()      # session-only; a fresh scan starts clean
         self.scan_status.set("New scan — ready for First Scan.")
 
     def on_refresh_values(self):
@@ -748,25 +927,44 @@ class GGModUI:
         """Checkbox handler: arm or pause the live-refresh loop."""
         self._update_scan_auto()
 
-    def _scan_auto_wanted(self):
-        """True only when it's safe & useful to be live-refreshing: toggle on,
-        attached, the Value Scanner tab is the visible one, and a scan has
-        results to show."""
+    def _scan_tab_visible(self):
         try:
-            if not self.scan_auto.get():
-                return False
-            if not self.engine.is_attached():
-                return False
-            if self.notebook.index("current") != 2:
-                return False
-            return bool(self.scanner.results)
+            return self.notebook.index("current") == 2
+        except Exception:
+            return False
+
+    def _scan_main_wanted(self):
+        """True when the MAIN results table should keep live-refreshing:
+        toggle on, attached, tab visible, and a scan has results to show."""
+        if not self.scan_auto.get():
+            return False
+        if not self.engine.is_attached():
+            return False
+        if not self._scan_tab_visible():
+            return False
+        return bool(self.scanner.results)
+
+    def _watch_wanted(self):
+        """True when the Watch List needs ticking: attached, tab visible, and
+        at least one watched address exists. Independent of the main table's
+        Auto-refresh toggle/results -- the Watch List always stays live."""
+        if not self.engine.is_attached():
+            return False
+        if not self._scan_tab_visible():
+            return False
+        return bool(self._watch_rows)
+
+    def _scan_auto_wanted(self):
+        try:
+            return self._scan_main_wanted() or self._watch_wanted()
         except Exception:
             return False
 
     def _update_scan_auto(self):
-        """Start the loop if it should run and isn't, or stop it if it
-        shouldn't. Called from tab-change, attach/detach, toggle, and after
-        every render so the timer never leaks or spins needlessly."""
+        """Start the single shared tick loop if either the main table or the
+        Watch List needs it and it isn't running, or stop it if neither does.
+        Called from tab-change, attach/detach, toggles, add/remove-watch, and
+        after every render so the timer never leaks or spins needlessly."""
         want = self._scan_auto_wanted()
         if want and self._scan_auto_job is None:
             self._scan_auto_job = self.root.after(
@@ -779,18 +977,23 @@ class GGModUI:
             self._scan_auto_job = None
 
     def _scan_auto_tick(self):
-        """One live-refresh pass: re-read only the displayed candidates' values
-        (no scan-type filtering, no Previous change, no scan-state advance) and
-        update the Value column in place, flashing changed rows."""
+        """One tick of the SHARED live-refresh loop: re-reads the main table's
+        displayed candidates (no scan-type filtering, no Previous change, no
+        scan-state advance) AND services the Watch List (freeze-writes +
+        live reads), whichever of the two currently applies. Single timer,
+        two jobs -- never two competing loops."""
         self._scan_auto_job = None
         if not self._scan_auto_wanted():
             return
-        try:
-            res = self.scanner.refresh_values()   # displayed subset only
-        except Exception:
-            res = {"error": "read failed"}
-        if "error" not in res:
-            self._apply_live_values(res.get("results", []))
+        if self._scan_main_wanted():
+            try:
+                res = self.scanner.refresh_values()   # displayed subset only
+            except Exception:
+                res = {"error": "read failed"}
+            if "error" not in res:
+                self._apply_live_values(res.get("results", []))
+        if self._watch_wanted():
+            self._tick_watchlist()
         # Re-arm for the next tick (conditions re-checked at the top).
         self._update_scan_auto()
 
@@ -1810,6 +2013,7 @@ class GGModUI:
         self.preview_ready_for = None
         self.refresh_mod_list()
         self._apply_scan_hotkeys()   # attached now False -> unregisters scan keys
+        self._clear_watchlist()      # frozen writes must not survive detach
         self._update_scan_auto()     # not attached -> pauses live refresh
 
     def update_status(self):
@@ -2866,6 +3070,7 @@ class GGModUI:
                 except Exception:
                     pass
             self._scan_flash_jobs.clear()
+            self._watch_rows.clear()     # Watch List is session-only
             if self.engine.is_attached():
                 self.log("Closing: detaching (stopping threads, restoring bytes)...")
                 self.on_detach()          # detaches engine (keeps bindings)
