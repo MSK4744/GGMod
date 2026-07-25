@@ -657,6 +657,7 @@ class GGModUI:
         self.watch_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
         wsb.config(command=self.watch_tree.yview)
         self.watch_tree.bind("<Button-1>", self._on_watch_click)
+        self.watch_tree.bind("<Double-1>", self._on_watch_double_click)
         # Tint a row while its Freeze is active, so it's visually distinct
         # from a plain watched (non-frozen) row.
         self.watch_tree.tag_configure(
@@ -687,6 +688,14 @@ class GGModUI:
             self._edit_watch_desc(wid)
         elif col == "remove":
             self._remove_watch_row(wid)
+
+    def _on_watch_double_click(self, event):
+        """Double-clicking the Value cell of a watched row edits it directly
+        (a one-time write via write_value -- not a mod, just like Force Set)."""
+        wid, col = self._watch_column_at(event)
+        if wid is None or col != "value":
+            return
+        self._edit_watch_value(wid)
 
     def _add_to_watchlist(self, _event=None):
         """Double-click handler on the main results table: copy the selected
@@ -752,6 +761,42 @@ class GGModUI:
             return
         row["desc"] = new_desc.strip()
         self.watch_tree.set(wid, "desc", row["desc"])
+
+    def _edit_watch_value(self, wid):
+        """Prompt for a new value and write it once to the watched address
+        (reuses scanner.write_value -- the same primitive Freeze uses, not a
+        mod). If the row is currently frozen, the new value becomes the value
+        held from then on, so the edit doesn't get overwritten on the next
+        tick by the OLD frozen value."""
+        row = self._watch_rows.get(wid)
+        if row is None:
+            return
+        if not self.engine.is_attached():
+            self.scan_status.set("Attach to a game first to edit a watched value.")
+            return
+        current = self.watch_tree.set(wid, "value")
+        new_str = simpledialog.askstring(
+            "Watch List", "New value for {} ({}):".format(
+                row["address_str"], row["vtype_label"]),
+            initialvalue=current, parent=self.root)
+        if new_str is None:
+            return
+        try:
+            parsed = self.scanner._parse_scalar(new_str, row["vtype_key"])
+        except (TypeError, ValueError):
+            self.scan_status.set(
+                "'{}' is not a valid {} value.".format(new_str, row["vtype_label"]))
+            return
+        if not self.scanner.write_value(row["address"], parsed, row["vtype_key"]):
+            self.scan_status.set(
+                "Failed to write to {} (Array of Bytes rows can't be edited "
+                "here).".format(row["address_str"]))
+            return
+        if row["active"]:
+            row["frozen_value"] = parsed
+        display = self.scanner._fmt_value(parsed)
+        self.watch_tree.set(wid, "value", display)
+        self.scan_status.set("Set {} = {}.".format(row["address_str"], display))
 
     def _remove_watch_row(self, wid):
         self._watch_rows.pop(wid, None)
