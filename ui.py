@@ -424,17 +424,20 @@ class GGModUI:
         self._fullwin_btn.pack(side=tk.RIGHT)
 
         # --- Body: results table (LEFT, expands) + controls (RIGHT, fixed) --
-        # Cheat-Engine arrangement: the results list dominates, controls sit in
-        # a narrow column on the right. Everything below uses fill/expand so the
-        # table grows and shrinks with the window instead of staying static.
-        body = tk.Frame(tab, bg=BG)
+        # Cheat-Engine arrangement in a draggable split: the results list is the
+        # left pane, controls the right pane. The sash between them can be
+        # dragged so the user scales the table to any width they like; the left
+        # pane also stretches when the whole window grows/shrinks.
+        body = tk.PanedWindow(
+            tab, orient=tk.HORIZONTAL, bg=BORDER, sashwidth=7,
+            sashrelief=tk.RAISED, bd=0, showhandle=True, handlesize=9,
+            handlepad=40, opaqueresize=True)
         body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 8))
+        self._scan_paned = body
 
-        # ---- RIGHT: controls column (packed first so it keeps its width when
-        # the window shrinks; the table then absorbs whatever is left). ----
-        controls = tk.Frame(body, bg=BG, width=self._SCAN_CTRL_WIDTH)
-        controls.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
-        controls.pack_propagate(False)   # honour the fixed column width
+        # ---- RIGHT pane: controls column. The PanedWindow (not pack) now owns
+        # its width; a minsize keeps the buttons/hotkeys from being crushed. ----
+        controls = tk.Frame(body, bg=BG)
 
         ctl = tk.Frame(controls, bg=BG)
         ctl.pack(fill=tk.X, pady=(0, 6))
@@ -534,13 +537,16 @@ class GGModUI:
                                lambda a=action: self.on_clear_scan_hotkey(a)).grid(
                 row=0, column=3, sticky="e")
 
-        # ---- LEFT: results table (fills all remaining space) ---------------
+        # ---- LEFT pane: results table (fills all remaining space) ----------
         results = tk.Frame(body, bg=BG)
-        results.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self._label(results, "Find an address by value (read-only). Double-click "
-                    "or Copy an address into Add Mod → From address…", fg=MUTED,
-                    font=(FONT, 8), wraplength=360, justify="left",
-                    anchor="w").pack(fill=tk.X, pady=(0, 4))
+        self._scan_intro = self._label(
+            results, "Find an address by value (read-only). Double-click "
+            "or Copy an address into Add Mod → From address…", fg=MUTED,
+            font=(FONT, 8), wraplength=360, justify="left", anchor="w")
+        self._scan_intro.pack(fill=tk.X, pady=(0, 4))
+        # Keep the intro text wrapping to the (draggable) pane width.
+        results.bind("<Configure>", lambda e: self._scan_intro.config(
+            wraplength=max(120, e.width - 8)))
 
         list_frame = tk.Frame(results, bg=BG)
         list_frame.pack(fill=tk.BOTH, expand=True)
@@ -561,6 +567,13 @@ class GGModUI:
         sb.config(command=self.scan_tree.yview)
         # Double-click a row copies its address to the clipboard.
         self.scan_tree.bind("<Double-1>", self._copy_scan_address)
+
+        # Register the panes: results left (stretches with the window), controls
+        # right (fixed-ish, minsize keeps it usable). Dragging the sash between
+        # them scales the results table to the user's liking.
+        body.add(results, stretch="always", minsize=170)
+        body.add(controls, stretch="never", minsize=230,
+                 width=self._SCAN_CTRL_WIDTH)
 
         self._sync_scan_value_state()
 
@@ -1370,14 +1383,25 @@ class GGModUI:
         frame = tk.Frame(self.root, bg=BG)
         frame.pack(fill=tk.BOTH, expand=False, padx=12, pady=(0, 12))
 
-        self._label(frame, "Log", fg=ACCENT, font=(FONT, 10, "bold")).pack(anchor="w")
+        # ---- Collapsible main Log -----------------------------------------
+        self._log_open = True
+        lhead = tk.Frame(frame, bg=BG)
+        lhead.pack(fill=tk.X)
+        self._log_toggle = tk.Button(
+            lhead, text="▾ Log", command=self._toggle_log,
+            bg=BG, fg=ACCENT, activebackground=BG, activeforeground=ACCENT,
+            relief=tk.FLAT, cursor="hand2", font=(FONT, 10, "bold"), anchor="w",
+            bd=0, padx=0,
+        )
+        self._log_toggle.pack(side=tk.LEFT)
+        self._button_ghost(lhead, "Clear", self._clear_log).pack(side=tk.RIGHT)
 
-        inner = tk.Frame(frame, bg=BG)
-        inner.pack(fill=tk.BOTH, expand=True)
-        scrollbar = tk.Scrollbar(inner)
+        self._log_body = tk.Frame(frame, bg=BG)   # packed only when open
+        self._log_body.pack(fill=tk.BOTH, expand=True)
+        scrollbar = tk.Scrollbar(self._log_body)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_widget = tk.Text(
-            inner, height=8, bg=BG3, fg=FG, insertbackground=FG,
+            self._log_body, height=8, bg=BG3, fg=FG, insertbackground=FG,
             font=(MONO, 9), wrap=tk.WORD, relief=tk.FLAT,
             yscrollcommand=scrollbar.set, state=tk.DISABLED,
         )
@@ -1388,6 +1412,8 @@ class GGModUI:
         self._key_log_open = False
         khead = tk.Frame(frame, bg=BG)
         khead.pack(fill=tk.X, pady=(6, 0))
+        # Reopening the main Log must re-pack it ABOVE this head, not at the end.
+        self._klog_head = khead
         self._key_log_toggle = tk.Button(
             khead, text="▸ Key Input Log", command=self._toggle_key_log,
             bg=BG, fg=MUTED, activebackground=BG, activeforeground=ACCENT,
@@ -1409,6 +1435,22 @@ class GGModUI:
         )
         self.key_log_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         kbar.config(command=self.key_log_widget.yview)
+
+    def _toggle_log(self):
+        self._log_open = not self._log_open
+        if self._log_open:
+            # Re-pack above the Key Input Log head so ordering is preserved.
+            self._log_body.pack(fill=tk.BOTH, expand=True,
+                                before=self._klog_head)
+            self._log_toggle.config(text="▾ Log")
+        else:
+            self._log_body.pack_forget()
+            self._log_toggle.config(text="▸ Log")
+
+    def _clear_log(self):
+        self.log_widget.config(state=tk.NORMAL)
+        self.log_widget.delete("1.0", tk.END)
+        self.log_widget.config(state=tk.DISABLED)
 
     def _toggle_key_log(self):
         self._key_log_open = not self._key_log_open
