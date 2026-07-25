@@ -680,7 +680,8 @@ class GGModUI:
         wsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.watch_tree = ttk.Treeview(
             list_frame,
-            columns=("active", "desc", "address", "type", "value", "remove"),
+            columns=("active", "desc", "address", "type", "value",
+                     "addmod", "remove"),
             show="headings", height=5, yscrollcommand=wsb.set)
         self.watch_tree.heading("active", text="Active", anchor="w")
         self.watch_tree.column("active", width=55, minwidth=50, anchor="w",
@@ -693,6 +694,9 @@ class GGModUI:
         self.watch_tree.column("type", width=90, minwidth=70, anchor="w")
         self.watch_tree.heading("value", text="Value", anchor="w")
         self.watch_tree.column("value", width=90, minwidth=60, anchor="w")
+        self.watch_tree.heading("addmod", text="", anchor="center")
+        self.watch_tree.column("addmod", width=90, minwidth=90,
+                               anchor="center", stretch=False)
         self.watch_tree.heading("remove", text="", anchor="center")
         self.watch_tree.column("remove", width=28, minwidth=28,
                                anchor="center", stretch=False)
@@ -728,6 +732,8 @@ class GGModUI:
             self._toggle_watch_active(wid)
         elif col == "desc":
             self._edit_watch_desc(wid)
+        elif col == "addmod":
+            self._use_watch_in_add_mod(wid)
         elif col == "remove":
             self._remove_watch_row(wid)
 
@@ -767,7 +773,8 @@ class GGModUI:
         }
         self.watch_tree.insert(
             "", "end", iid=wid,
-            values=("☐", "", addr_str, vtype_label, value_str, "✕"))
+            values=("☐", "", addr_str, vtype_label, value_str,
+                    "→ Add Mod", "✕"))
         self.scan_status.set("Added {} to Watch List.".format(addr_str))
         self._update_scan_auto()   # the watch tick may now need to start
 
@@ -839,6 +846,25 @@ class GGModUI:
         display = self.scanner._fmt_value(parsed)
         self.watch_tree.set(wid, "value", display)
         self.scan_status.set("Set {} = {}.".format(row["address_str"], display))
+
+    def _use_watch_in_add_mod(self, wid):
+        """'Use in Add Mod': switch to the Add Mod tab and open the same
+        'From address...' dialog a hook row already offers, pre-filled with
+        this watched address. Pure navigation + pre-fill -- does not touch
+        build_candidate_from_address or any of its matching/auto-fill logic."""
+        row = self._watch_rows.get(wid)
+        if row is None:
+            return
+        self.notebook.select(1)   # Add Mod tab (0=Selected Mod, 2=Value Scanner)
+        # Hook rows -- and therefore "From address..." -- only exist for the
+        # pointer_capture template. Switching template only toggles which form
+        # rows are shown; it does not clear anything the user already typed.
+        if self.form_vars["template"].get() != "pointer_capture":
+            self.form_vars["template"].set("pointer_capture")
+            self._refresh_form_fields()   # seeds one empty hook row
+        if not self._hook_entries:
+            self._add_hook_row()
+        self._from_address(self._hook_entries[0], prefill_address=row["address_str"])
 
     def _remove_watch_row(self, wid):
         self._watch_rows.pop(wid, None)
@@ -1577,12 +1603,16 @@ class GGModUI:
                 "region — double-check it disassembled correctly.".format(steal))
         self.log(msg)
 
-    def _from_address(self, entry):
+    def _from_address(self, entry, prefill_address=None):
         """Dialog: read a live address, disassemble, and auto-fill the hook.
 
         Reuses engine.build_candidate_from_address (capstone + scan_aob). The
         user reviews the decoded instructions + match count, then fills the
-        AOB / register / struct_offset / module fields (all stay editable)."""
+        AOB / register / struct_offset / module fields (all stay editable).
+
+        `prefill_address` (e.g. from the Watch List's "Use in Add Mod") only
+        fills the Address field -- it's a navigation convenience and does not
+        auto-run Read or change any matching/auto-fill behaviour below."""
         self.form_error_var.set("")
         if not self.engine.is_attached():
             self.form_error_var.set(
@@ -1598,10 +1628,12 @@ class GGModUI:
         head = tk.Frame(top, bg=BG)
         head.pack(fill=tk.X, padx=12, pady=(12, 4))
         self._label(head, "Address (hex, from Cheat Engine):", fg=MUTED).pack(side=tk.LEFT)
-        addr_var = tk.StringVar()
+        addr_var = tk.StringVar(value=prefill_address or "")
         addr_entry = self._entry(head, addr_var, width=18)
         addr_entry.pack(side=tk.LEFT, padx=(6, 6))
         addr_entry.focus_set()
+        if prefill_address:
+            addr_entry.select_range(0, tk.END)   # pre-filled + selected, ready to Read
 
         result_txt = tk.Text(top, width=64, height=12, bg=BG3, fg=FG, relief=tk.FLAT,
                              wrap=tk.NONE, font=(MONO, 9), state=tk.DISABLED)
