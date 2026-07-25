@@ -118,11 +118,14 @@ class GGModUI:
         self._set_window_icon()
         self.root.configure(bg=BG)
         self.root.geometry("1040x720")
-        # Floor is set just above the top bar's natural width (~826px) so the
-        # window genuinely shrinks from the old 900x600 without clipping the
-        # Attach/New Game row. The main area (fixed 460 right panel + mod list)
-        # squeezes gracefully because every panel uses fill/expand.
-        self.root.minsize(880, 500)
+        # Width floor is set just above the top bar's natural width (~826px)
+        # so the window genuinely shrinks without clipping the Attach/New Game
+        # row. Height floor accounts for the Value Scanner tab's fixed chrome
+        # (header + Watch List panel + Log panel, ~500px combined) plus a
+        # non-degenerate minimum for the results table + controls column
+        # (~180px) -- below this the Scanner tab's body would collapse to
+        # near-zero height instead of just needing its own scrollbar.
+        self.root.minsize(880, 680)
 
         self._resolve_font()
         self._setup_style()
@@ -447,9 +450,48 @@ class GGModUI:
         body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 8))
         self._scan_paned = body
 
-        # ---- RIGHT pane: controls column. The PanedWindow (not pack) now owns
-        # its width; a minsize keeps the buttons/hotkeys from being crushed. ----
-        controls = tk.Frame(body, bg=BG)
+        # ---- RIGHT pane: controls column, wrapped in its own scrollable
+        # canvas. The Watch List panel below can push the whole tab's
+        # available height down to whatever's left, so the controls column
+        # must never depend on getting enough natural height to show
+        # everything -- scrolling this canvas always reaches every control,
+        # including the last Scan Hotkeys row, regardless of window size.
+        controls_outer = tk.Frame(body, bg=BG)
+        controls_canvas = tk.Canvas(controls_outer, bg=BG, highlightthickness=0, bd=0)
+        self._scan_ctrl_canvas = controls_canvas   # exposed for tests / scroll-to
+        controls_sb = tk.Scrollbar(controls_outer, orient=tk.VERTICAL,
+                                   command=controls_canvas.yview)
+        controls_canvas.configure(yscrollcommand=controls_sb.set)
+        controls_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        controls_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # The actual controls live in this frame; it's just a canvas item, so
+        # every widget below is built exactly as before -- only the container
+        # around them changed.
+        controls = tk.Frame(controls_canvas, bg=BG)
+        controls_win = controls_canvas.create_window((0, 0), window=controls,
+                                                      anchor="nw")
+
+        def _controls_inner_configure(_e=None):
+            controls_canvas.configure(scrollregion=controls_canvas.bbox("all"))
+        controls.bind("<Configure>", _controls_inner_configure)
+
+        def _controls_canvas_configure(e):
+            # Match the inner frame's width to the visible canvas width so
+            # fill=X / sticky="ew" widgets still stretch to the column width.
+            controls_canvas.itemconfigure(controls_win, width=e.width)
+        controls_canvas.bind("<Configure>", _controls_canvas_configure)
+
+        # Mouse-wheel scrolling, active only while the pointer is actually
+        # over this column (bound/unbound on enter/leave) so it never steals
+        # wheel events from the results table, log, or other tabs.
+        def _controls_wheel(e):
+            controls_canvas.yview_scroll(int(-e.delta / 40), "units")
+        controls_canvas.bind(
+            "<Enter>",
+            lambda _e: controls_canvas.bind_all("<MouseWheel>", _controls_wheel))
+        controls_canvas.bind(
+            "<Leave>", lambda _e: controls_canvas.unbind_all("<MouseWheel>"))
 
         ctl = tk.Frame(controls, bg=BG)
         ctl.pack(fill=tk.X, pady=(0, 6))
@@ -611,7 +653,7 @@ class GGModUI:
         # right (fixed-ish, minsize keeps it usable). Dragging the sash between
         # them scales the results table to the user's liking.
         body.add(results, stretch="always", minsize=170)
-        body.add(controls, stretch="never", minsize=230,
+        body.add(controls_outer, stretch="never", minsize=230,
                  width=self._SCAN_CTRL_WIDTH)
 
         self._sync_scan_value_state()
