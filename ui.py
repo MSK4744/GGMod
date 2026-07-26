@@ -23,19 +23,20 @@ import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 
 # ---------------------------------------------------------------------------
-# Theme: "Vault" dark — slate surfaces with a blue brand accent, adapted from
-# the Password Manager (Tailwind slate + brand-blue) design language.
+# Theme: "Vault" dark — slate surfaces with a muted slate-teal brand accent.
+# Softer than a saturated brand-blue: desaturated, calmer, easier on the eyes
+# over long sessions, while keeping the same dark slate base and status colors.
 # ---------------------------------------------------------------------------
 BG = "#0f172a"          # slate-900  — main window / panels
 BG2 = "#1e293b"         # slate-800  — raised: headings bar, hover, badges
 BG3 = "#020617"         # slate-950  — deepest: log, inputs
 FG = "#e2e8f0"          # slate-200  — primary text
 MUTED = "#94a3b8"       # slate-400  — muted / secondary text
-ACCENT = "#327dff"      # brand-500  — accent (blue): headings, focus, hover
-ACCENT2 = "#1b5cf5"     # brand-600  — filled primary button base
-ACCENT_SOFT = "#1d2b53" # brand tint on dark — selected/active surface
-GREEN = "#22c55e"       # green-500  — success / active
-RED = "#f43f5e"         # rose-500   — danger / error
+ACCENT = "#7dabc9"      # muted slate-blue — headings, focus, hover
+ACCENT2 = "#3f6f8f"     # desaturated blue — filled primary button base
+ACCENT_SOFT = "#22384a" # accent tint on dark — selected/active surface
+GREEN = "#22c55e"       # green-500  — success / active / ready
+RED = "#f43f5e"         # rose-500   — danger / error / blocked
 AMBER = "#f59e0b"       # amber-500  — warning / multiple-match
 BORDER = "#334155"      # slate-700  — borders
 WHITE = "#ffffff"
@@ -78,6 +79,12 @@ REGISTERS = [
 
 # AOB tokens: pairs of hex digits or a "??" / "?" wildcard, space-separated.
 _AOB_TOKEN = re.compile(r"^([0-9A-Fa-f]{2}|\?\?|\?)$")
+
+# Sentinel default for _from_address/_paste_line's offset_var param: means
+# "use self.form_vars['struct_offset']" (pointer_capture's default), so it's
+# distinguishable from an explicit offset_var=None ("don't fill any offset
+# field" -- used when wiring these into hard_freeze's AOB row).
+_USE_STRUCT_OFFSET = object()
 
 
 class GGModUI:
@@ -207,22 +214,28 @@ class GGModUI:
         # bg / activebackground are overridable (e.g. a red Delete button).
         bg = kw.pop("bg", ACCENT2)
         active = kw.pop("activebackground", ACCENT)
+        font = kw.pop("font", (FONT, 9, "bold"))
+        padx = kw.pop("padx", 12)
+        pady = kw.pop("pady", 5)
         return tk.Button(
             parent, text=text, command=command,
             bg=bg, fg=WHITE, activebackground=active, activeforeground=WHITE,
-            relief=tk.FLAT, bd=0, padx=12, pady=5,
-            font=(FONT, 9, "bold"), cursor="hand2",
+            relief=tk.FLAT, bd=0, padx=padx, pady=pady,
+            font=font, cursor="hand2",
             highlightthickness=0, disabledforeground="#64748b",  # slate-500
             **kw
         )
 
     def _button_ghost(self, parent, text, command, **kw):
         # Secondary/ghost button: transparent with slate text, subtle hover.
+        font = kw.pop("font", (FONT, 9, "bold"))
+        padx = kw.pop("padx", 12)
+        pady = kw.pop("pady", 5)
         return tk.Button(
             parent, text=text, command=command,
             bg=BG2, fg=FG, activebackground=BORDER, activeforeground=FG,
-            relief=tk.FLAT, bd=0, padx=12, pady=5,
-            font=(FONT, 9, "bold"), cursor="hand2",
+            relief=tk.FLAT, bd=0, padx=padx, pady=pady,
+            font=font, cursor="hand2",
             highlightthickness=0, disabledforeground="#64748b",
             **kw
         )
@@ -233,6 +246,28 @@ class GGModUI:
             bg=BG3, fg=FG, insertbackground=ACCENT, relief=tk.FLAT, bd=0,
             highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT,
         )
+
+    def _dialog(self, title, minsize=(360, 160), resizable=True, modal=True):
+        """Create a Toplevel with the app's consistent dialog conventions:
+        dark background, a sensible minimum size so content never clips, and
+        genuine resizability (rather than a fixed-size popup that overlaps/
+        truncates when content grows).
+
+        `modal=True` (the default, used by short-lived popups like "Build
+        hook from address") makes it transient + grabs input focus. Tool
+        windows meant to stay open alongside the main window (Value Scanner,
+        Find Writes) pass modal=False so the user can interact with both at
+        once -- no transient/grab_set, so it behaves as an independent
+        top-level window."""
+        top = tk.Toplevel(self.root)
+        top.title(title)
+        top.configure(bg=BG)
+        top.minsize(*minsize)
+        top.resizable(resizable, resizable)
+        if modal:
+            top.transient(self.root)
+            top.grab_set()
+        return top
 
     # ==================================================================
     # Top bar: game selector, attach/detach, status
@@ -272,6 +307,14 @@ class GGModUI:
         self.detach_btn = self._button_ghost(bar, "Detach", self.on_detach)
         self.detach_btn.pack(side=tk.LEFT, padx=4)
 
+        # Value Scanner / Find Writes are independent, non-modal tool windows
+        # (not notebook tabs) so they can stay open side-by-side with the main
+        # window -- e.g. to copy an address from one into the other.
+        self._button_ghost(bar, "Value Scanner",
+                           self.open_scanner_window).pack(side=tk.LEFT, padx=(16, 4))
+        self._button_ghost(bar, "Find Writes",
+                           self.open_findwrites_window).pack(side=tk.LEFT, padx=4)
+
         self.status_var = tk.StringVar(value="● Not attached")
         self.status_label = self._label(
             bar, "", fg=RED, font=(FONT, 10, "bold"),
@@ -292,7 +335,6 @@ class GGModUI:
         # ---- Left: mod list + per-mod action buttons ----
         left = tk.Frame(main, bg=BG)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self._left_panel = left       # hidden in Value Scanner full-window mode
 
         self._label(left, "Mods", fg=ACCENT, font=(FONT, 11, "bold")).pack(anchor="w")
 
@@ -382,26 +424,35 @@ class GGModUI:
                     "unlock & grab the pointer on the next hook fire",
                     fg=MUTED, font=(FONT, 8)).pack(side=tk.LEFT)
 
-        # ---- Right: notebook (Selected Mod / Add Mod / Value Scanner) ----
+        # ---- Right: notebook (Selected Mod / Add Mod) ----
+        # Value Scanner and Find Writes are separate top-level windows (see
+        # open_scanner_window / open_findwrites_window), not tabs here.
         right = tk.Frame(main, bg=BG, width=460)
         right.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(12, 0))
         right.pack_propagate(False)
-        self._right_panel = right     # widened to full window in scanner mode
-        self._right_default_width = 460
-        self._scanner_fullwindow = False
-        self._fullwin_owner = None    # tab index that turned full-window on
 
         self.notebook = ttk.Notebook(right)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
         self._build_details_tab()
         self._build_add_tab()
-        self._build_scanner_tab()
-        self._build_findwrites_tab()
-        # Leaving the Value Scanner tab exits its full-window mode.
-        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
-    # ---- Value Scanner tab (CE-style find tool) ---------------------
+        # Independent tool windows, created lazily on first open (see
+        # open_scanner_window / open_findwrites_window); None while closed.
+        self._scan_win = None
+        self._fw_win = None
+        # Scanner/Find-Writes session state, initialized unconditionally so
+        # detach/close/watchlist helpers work even before either tool window
+        # has been opened. Rebuilt fresh each time the owning window opens.
+        self._watch_rows = {}
+        self._scan_auto_job = None
+        self._scan_prev_vals = {}
+        self._scan_flash_jobs = {}
+        self._fw_rows = {}
+        self._fw_poll_job = None
+        self._fw_auto_fired = False
+
+    # ---- Value Scanner window (CE-style find tool) -------------------
     _SCAN_VALUE_TYPE_LABELS = [
         ("4 Bytes", "4 bytes"), ("2 Bytes", "2 bytes"), ("1 Byte", "1 byte"),
         ("8 Bytes", "8 bytes"), ("Float", "float"), ("Double", "double"),
@@ -422,28 +473,59 @@ class GGModUI:
     _SCAN_AUTO_MS = 250
     _SCAN_FLASH_MS = 700
 
-    def _build_scanner_tab(self):
-        tab = tk.Frame(self.notebook, bg=BG)
-        self.notebook.add(tab, text="Value Scanner")
+    def open_scanner_window(self):
+        """Open the Value Scanner tool window, or focus it if already open."""
+        if self._scan_win is not None and self._scan_win.winfo_exists():
+            self._scan_win.deiconify()
+            self._scan_win.lift()
+            self._scan_win.focus_force()
+            return
+        self._build_scanner_window()
 
-        # --- Header row (title + full-window toggle) ---------------------
-        header = tk.Frame(tab, bg=BG)
+    def _close_scanner_window(self):
+        """Tear down the scanner window and reset its session state -- the
+        same "cleared on close" convention the Watch List already followed
+        while it lived inside the main window."""
+        if self._scan_auto_job is not None:
+            try:
+                self.root.after_cancel(self._scan_auto_job)
+            except Exception:
+                pass
+            self._scan_auto_job = None
+        for job in self._scan_flash_jobs.values():
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self._scan_flash_jobs = {}
+        self._watch_rows = {}
+        try:
+            self.scanner.new_scan()
+        except Exception:
+            pass
+        win = self._scan_win
+        self._scan_win = None
+        if win is not None:
+            win.destroy()
+
+    def _build_scanner_window(self):
+        top = self._dialog("Value Scanner", minsize=(760, 560), modal=False)
+        self._scan_win = top
+        top.protocol("WM_DELETE_WINDOW", self._close_scanner_window)
+
+        # --- Header row ----------------------------------------------------
+        header = tk.Frame(top, bg=BG)
         header.pack(fill=tk.X, padx=8, pady=(8, 2))
         self._label(header, "Memory Value Scanner", fg=ACCENT,
                     font=(FONT, 11, "bold")).pack(side=tk.LEFT)
-        # Full-window toggle: hides the mod list so the scanner uses the whole
-        # window (a roomier results table). Auto-exits when leaving this tab.
-        self._fullwin_btn = self._button_ghost(
-            header, "⤢ Full window", self._toggle_scanner_fullwindow)
-        self._fullwin_btn.pack(side=tk.RIGHT)
 
         # --- Watch List: CE-style saved-address panel, docked to the bottom of
-        # the tab. Packed with side=BOTTOM BEFORE the expanding body below, so
-        # it reliably claims its own space instead of being squeezed to zero.
+        # the window. Packed with side=BOTTOM BEFORE the expanding body below,
+        # so it reliably claims its own space instead of being squeezed to zero.
         self._watch_rows = {}    # wid -> {address, vtype_key/label, desc,
                                  # active, frozen_value} -- session-only, never
                                  # persisted (cleared on detach/New Scan/close).
-        self._build_watchlist_panel(tab)
+        self._build_watchlist_panel(top)
 
         # --- Body: results table (LEFT, expands) + controls (RIGHT, fixed) --
         # Cheat-Engine arrangement in a draggable split: the results list is the
@@ -451,7 +533,7 @@ class GGModUI:
         # dragged so the user scales the table to any width they like; the left
         # pane also stretches when the whole window grows/shrinks.
         body = tk.PanedWindow(
-            tab, orient=tk.HORIZONTAL, bg=BORDER, sashwidth=7,
+            top, orient=tk.HORIZONTAL, bg=BORDER, sashwidth=7,
             sashrelief=tk.RAISED, bd=0, showhandle=True, handlesize=9,
             handlepad=40, opaqueresize=True)
         body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 8))
@@ -556,9 +638,10 @@ class GGModUI:
             row=3, column=0, columnspan=2, sticky="ew", pady=2)
 
         # Live auto-refresh toggle (CE-style continuous value updates). Default
-        # ON, but it only actually runs once a scan has results and the tab is
-        # visible + attached (see _update_scan_auto). State lives here so the
-        # loop can be armed/paused from tab-change / attach / detach events.
+        # ON, but it only actually runs once a scan has results and this
+        # window is open + attached (see _update_scan_auto). State lives here
+        # so the loop can be armed/paused from window-open/close and
+        # attach/detach events.
         self._scan_auto_job = None
         self._scan_prev_vals = {}      # iid -> last shown value (flash compare)
         self._scan_flash_jobs = {}     # iid -> pending flash-reset after() id
@@ -664,31 +747,58 @@ class GGModUI:
                  width=self._SCAN_CTRL_WIDTH)
 
         self._sync_scan_value_state()
+        self._update_scan_auto()   # sync live-refresh state for the fresh window
 
     # ==================================================================
-    # Find Writes tab -- hardware-breakpoint "what writes to this address"
+    # Find Writes window -- hardware-breakpoint "what writes to this address"
     # ==================================================================
     # Follows the Value Scanner's layout conventions: a PanedWindow with the
     # results list on the left (stretches) and a scrollable controls column on
-    # the right. Unlike every other tab, this one drives a real Windows
+    # the right. Unlike Selected Mod/Add Mod, this one drives a real Windows
     # DEBUGGER on the target (engine.DebugSession), so the session lifecycle is
     # explicit and always torn down -- see _stop_watch / on_detach / on_close.
     _FW_POLL_MS = 200        # how often the UI drains the hit queue
 
-    def _build_findwrites_tab(self):
-        tab = tk.Frame(self.notebook, bg=BG)
-        self.notebook.add(tab, text="Find Writes")
+    def open_findwrites_window(self):
+        """Open the Find Writes tool window, or focus it if already open."""
+        if self._fw_win is not None and self._fw_win.winfo_exists():
+            self._fw_win.deiconify()
+            self._fw_win.lift()
+            self._fw_win.focus_force()
+            return
+        self._build_findwrites_window()
 
-        header = tk.Frame(tab, bg=BG)
+    def _close_findwrites_window(self):
+        """Tear down the Find Writes window. Stops any running debug session
+        first -- a hardware breakpoint left armed with no window to show its
+        hits would strand the game, so this mirrors on_detach/on_close."""
+        self._stop_watch(reason="Stopped — Find Writes window closed.")
+        self._clear_fw_hits()
+        win = self._fw_win
+        self._fw_win = None
+        if win is not None:
+            win.destroy()
+
+    def _build_findwrites_window(self):
+        top = self._dialog("Find Writes", minsize=(760, 520), modal=False)
+        self._fw_win = top
+        top.protocol("WM_DELETE_WINDOW", self._close_findwrites_window)
+
+        # Session state. _fw_rows maps instruction address -> hit payload so
+        # repeat writes from the same instruction update one row (CE-style)
+        # instead of flooding the list. Reset fresh on every open, consistent
+        # with "state resets when the window is closed and reopened".
+        self._fw_rows = {}
+        self._fw_poll_job = None
+        self._fw_auto_fired = False
+
+        header = tk.Frame(top, bg=BG)
         header.pack(fill=tk.X, padx=8, pady=(8, 2))
         self._label(header, "Find What Writes to an Address", fg=ACCENT,
                     font=(FONT, 11, "bold")).pack(side=tk.LEFT)
-        self._fw_fullwin_btn = self._button_ghost(
-            header, "⤢ Full window", self._toggle_fw_fullwindow)
-        self._fw_fullwin_btn.pack(side=tk.RIGHT)
 
         body = tk.PanedWindow(
-            tab, orient=tk.HORIZONTAL, bg=BORDER, sashwidth=7,
+            top, orient=tk.HORIZONTAL, bg=BORDER, sashwidth=7,
             sashrelief=tk.RAISED, bd=0, showhandle=True, handlesize=9,
             handlepad=40, opaqueresize=True)
         body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 8))
@@ -801,13 +911,6 @@ class GGModUI:
         body.add(ctl_outer, stretch="never", minsize=230,
                  width=self._SCAN_CTRL_WIDTH)
 
-        # Session state. _fw_rows maps instruction address -> hit payload so
-        # repeat writes from the same instruction update one row (CE-style)
-        # instead of flooding the list.
-        self._fw_rows = {}
-        self._fw_poll_job = None
-        self._fw_auto_fired = False
-
     # ---- Find Writes: session control ---------------------------------
     def on_start_watch(self):
         """Begin a debug session watching the entered address for writes."""
@@ -850,6 +953,13 @@ class GGModUI:
     def on_stop_watch(self):
         self._stop_watch(reason="Stopped watching.")
 
+    def _fw_window_open(self):
+        """True while the Find Writes tool window is open (it's a separate
+        Toplevel now, not a notebook tab). Checked instead of hasattr(), since
+        the widget attributes linger (pointing at destroyed widgets) after the
+        window has been closed once."""
+        return self._fw_win is not None and bool(self._fw_win.winfo_exists())
+
     def _stop_watch(self, reason="Stopped watching."):
         """Tear the debug session down. Safe to call when nothing is running,
         so detach/close paths can call it unconditionally."""
@@ -863,7 +973,7 @@ class GGModUI:
         res = self.debugger.stop()
         if running:
             self.log("Find Writes: session stopped; debugger detached.")
-        if hasattr(self, "fw_start_btn"):
+        if self._fw_window_open():
             self.fw_start_btn.config(state=tk.NORMAL)
             self.fw_stop_btn.config(state=tk.DISABLED)
             if "error" in res:
@@ -874,7 +984,7 @@ class GGModUI:
 
     def _clear_fw_hits(self):
         self._fw_rows = {}
-        if hasattr(self, "fw_tree"):
+        if self._fw_window_open():
             self.fw_tree.delete(*self.fw_tree.get_children())
 
     def _schedule_fw_poll(self):
@@ -1176,12 +1286,17 @@ class GGModUI:
         """Shared 'take this address into Add Mod' navigation.
 
         Used by BOTH the Watch List's "-> Add Mod" button and Find Writes'
-        "Send this address", so the two never drift apart. Switches to the Add
-        Mod tab and opens the same "From address..." dialog a hook row already
-        offers, pre-filled. Pure navigation + pre-fill -- it does not touch
-        build_candidate_from_address or any of its matching/auto-fill logic.
+        "Send this address", so the two never drift apart. Value Scanner and
+        Find Writes are separate windows now, so this also brings the main
+        window to the front before switching tabs. Then opens the same "From
+        address..." dialog a hook row already offers, pre-filled. Pure
+        navigation + pre-fill -- it does not touch build_candidate_from_address
+        or any of its matching/auto-fill logic.
         """
-        self.notebook.select(1)   # Add Mod tab (0=Selected Mod, 2=Value Scanner)
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+        self.notebook.select(1)   # Add Mod tab (0=Selected Mod, 1=Add Mod)
         # Hook rows -- and therefore "From address..." -- only exist for the
         # pointer_capture template. Switching template only toggles which form
         # rows are shown; it does not clear anything the user already typed.
@@ -1212,7 +1327,10 @@ class GGModUI:
         Clear, New Scan, detach, and app close; the Watch List is session-only
         and is never persisted to disk."""
         self._watch_rows.clear()
-        if hasattr(self, "watch_tree"):
+        # Guard on the window (not just hasattr) -- watch_tree is destroyed
+        # along with the Value Scanner window on close, but the attribute
+        # itself lingers, so a stale reference would raise TclError here.
+        if self._scan_window_open():
             self.watch_tree.delete(*self.watch_tree.get_children())
         self._update_scan_auto()
 
@@ -1374,30 +1492,34 @@ class GGModUI:
         """Checkbox handler: arm or pause the live-refresh loop."""
         self._update_scan_auto()
 
-    def _scan_tab_visible(self):
-        try:
-            return self.notebook.index("current") == 2
-        except Exception:
-            return False
+    def _scan_window_open(self):
+        """True while the Value Scanner tool window is open (it's a separate
+        Toplevel now, not a notebook tab)."""
+        return self._scan_win is not None and bool(self._scan_win.winfo_exists())
 
     def _scan_main_wanted(self):
         """True when the MAIN results table should keep live-refreshing:
-        toggle on, attached, tab visible, and a scan has results to show."""
+        toggle on, attached, window open, and a scan has results to show.
+
+        Window-open is checked FIRST: self.scan_auto only exists once the
+        Value Scanner window has been built at least once, so this must
+        short-circuit before touching it.
+        """
+        if not self._scan_window_open():
+            return False
         if not self.scan_auto.get():
             return False
         if not self.engine.is_attached():
             return False
-        if not self._scan_tab_visible():
-            return False
         return bool(self.scanner.results)
 
     def _watch_wanted(self):
-        """True when the Watch List needs ticking: attached, tab visible, and
+        """True when the Watch List needs ticking: attached, window open, and
         at least one watched address exists. Independent of the main table's
         Auto-refresh toggle/results -- the Watch List always stays live."""
         if not self.engine.is_attached():
             return False
-        if not self._scan_tab_visible():
+        if not self._scan_window_open():
             return False
         return bool(self._watch_rows)
 
@@ -1505,45 +1627,6 @@ class GGModUI:
         self.root.clipboard_append(address)
         self.scan_status.set("Copied {} to clipboard.".format(address))
 
-    def _toggle_fullwindow(self, owner_tab, button):
-        """Hide/show the left mod list so the owning tab fills the window.
-
-        Shared by the Value Scanner and Find Writes tabs -- both have wide
-        results tables that are cramped inside the fixed-width right panel.
-        `owner_tab` records which tab turned it on so _on_tab_changed knows to
-        restore the mod list when the user navigates away.
-        """
-        self._scanner_fullwindow = not self._scanner_fullwindow
-        if self._scanner_fullwindow:
-            self._fullwin_owner = owner_tab
-            self._left_panel.pack_forget()
-            self._right_panel.pack_configure(expand=True, padx=0)
-            button.config(text="⤢ Exit full window")
-        else:
-            self._fullwin_owner = None
-            self._right_panel.pack_configure(expand=False, padx=(12, 0))
-            self._left_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
-                                  before=self._right_panel)
-            button.config(text="⤢ Full window")
-
-    def _toggle_scanner_fullwindow(self):
-        self._toggle_fullwindow(2, self._fullwin_btn)
-
-    def _toggle_fw_fullwindow(self):
-        self._toggle_fullwindow(3, self._fw_fullwin_btn)
-
-    def _on_tab_changed(self, _event=None):
-        # Auto-exit full-window mode when the user leaves the tab that turned
-        # it on, so every other tab keeps the mod list.
-        if self._scanner_fullwindow and \
-                self.notebook.index("current") != self._fullwin_owner:
-            self._toggle_fullwindow(
-                self._fullwin_owner,
-                self._fw_fullwin_btn if self._fullwin_owner == 3
-                else self._fullwin_btn)
-        # Entering the scanner arms live refresh; leaving it pauses the loop.
-        self._update_scan_auto()
-
     # ---- Scan hotkeys: global, user-bindable, reuse HotkeyManager --------
     def _scan_key_conflict(self, key, exclude_action=None):
         """Return a description of what holds `key` across mod AND scan
@@ -1635,6 +1718,10 @@ class GGModUI:
     def _on_scan_hotkey(self, action):
         """Global-hotkey callback (runs on the keyboard hook thread). Fires the
         same Next Scan the button would, with this action's fixed scan type."""
+        if not self._scan_window_open():
+            self.log("Scan hotkey: {} ignored — open the Value Scanner window "
+                     "first.".format(SCAN_HOTKEY_LABELS[action]))
+            return
         self.log("Scan hotkey: {}.".format(SCAN_HOTKEY_LABELS[action]))
         # Marshal to the main thread; the async helper does the worker + render.
         self.root.after(
@@ -1724,8 +1811,46 @@ class GGModUI:
         self.form_vars["aob"] = tk.StringVar()
         self._add_form_row("aob", "AOB", entry(self.form_vars["aob"], width=30))
 
-        # hard_freeze fields
+        # hard_freeze's AOB gets the same AOB-building tools already wired
+        # into pointer_capture's hook rows -- "From address...", "Paste
+        # line...", and "Auto" steal -- reusing the exact same dialogs/logic
+        # (build_candidate_from_address, parse_disasm_line, compute_min_steal)
+        # rather than duplicating it. hard_freeze has no register/module/
+        # struct_offset concept, so those are throwaway advisory-only vars
+        # here; only "aob" (shared with the form) and "hook_offset" (aliased
+        # to hard_freeze's real "Offset" field -- the byte position within
+        # the AOB match, the same kind of instruction-aligned quantity Auto
+        # computes for pointer_capture's steal length) are real, persisted
+        # fields. offset_var=None on the dialogs below means "don't fill any
+        # offset field from struct_offset" -- that's a different quantity
+        # (a struct-member displacement) that doesn't apply to hard_freeze.
         self.form_vars["offset"] = tk.StringVar()
+        self._hf_aob_entry = {
+            "aob": self.form_vars["aob"],
+            "register": tk.StringVar(value="esi"),
+            "module": tk.StringVar(value=""),
+            "jmp_type": tk.StringVar(value="rel32"),
+            "suggest": tk.StringVar(value=""),
+            "hook_offset": self.form_vars["offset"],
+        }
+        aob_tools = tk.Frame(self.form, bg=BG)
+        aob_tools.grid(row=self._row_index, column=0, sticky="w", pady=(0, 2))
+        self._label(aob_tools, "", width=20, anchor="w").pack(side=tk.LEFT)
+        self._button(
+            aob_tools, "From address…",
+            lambda: self._from_address(self._hf_aob_entry, offset_var=None),
+            font=(FONT, 8, "bold")).pack(side=tk.LEFT, padx=(0, 4))
+        self._button(
+            aob_tools, "Paste line…",
+            lambda: self._paste_line(self._hf_aob_entry, offset_var=None),
+            font=(FONT, 8, "bold")).pack(side=tk.LEFT, padx=(0, 4))
+        self._button(
+            aob_tools, "Auto", lambda: self._auto_steal(self._hf_aob_entry),
+            font=(FONT, 8, "bold")).pack(side=tk.LEFT)
+        self.form_rows["aob_tools"] = aob_tools
+        self._row_index += 1
+
+        # hard_freeze fields
         self._add_form_row("offset", "Offset", entry(self.form_vars["offset"]))
 
         self.form_vars["freeze_mode"] = tk.StringVar(value=FREEZE_MODES[0])
@@ -1820,28 +1945,33 @@ class GGModUI:
             "suggest": tk.StringVar(value=""),   # inline suggestion note
         }
 
+        # Row 1: AOB label + entry, stretching to the full row width.
         line1 = tk.Frame(row, bg=BG2)
         line1.pack(fill=tk.X, padx=4, pady=(3, 0))
         self._label(line1, "AOB:", fg=MUTED, bg=BG2, width=5, anchor="w").pack(side=tk.LEFT)
-        tk.Entry(line1, textvariable=entry_vars["aob"], width=34, bg=BG3, fg=FG,
+        tk.Entry(line1, textvariable=entry_vars["aob"], bg=BG3, fg=FG,
                  insertbackground=FG, relief=tk.SOLID, bd=1,
                  highlightthickness=1, highlightbackground=BORDER,
-                 highlightcolor=ACCENT).pack(side=tk.LEFT)
+                 highlightcolor=ACCENT).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Row 1b: the two fill-from actions on their own line, in a 2-column
+        # grid with equal weight, so they always share the available width
+        # evenly and never clip or overlap regardless of the panel's width.
+        line1b = tk.Frame(row, bg=BG2)
+        line1b.pack(fill=tk.X, padx=4, pady=(3, 0))
+        line1b.columnconfigure(0, weight=1)
+        line1b.columnconfigure(1, weight=1)
         # Auto-fill AOB/register/offset from a live memory address (Cheat Engine).
         # `entry` is assigned below; the closure resolves it at click time.
-        tk.Button(
-            line1, text="From address…",
-            command=lambda: self._from_address(entry),
-            bg=ACCENT2, fg=WHITE, activebackground=ACCENT, activeforeground=WHITE,
-            relief=tk.FLAT, cursor="hand2", font=(FONT, 8, "bold"), padx=6,
-        ).pack(side=tk.LEFT, padx=(6, 0))
+        self._button(
+            line1b, "From address…", lambda: self._from_address(entry),
+            font=(FONT, 8, "bold"),
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 3))
         # Offline: paste a disassembly line to fill register/offset (no attach).
-        tk.Button(
-            line1, text="Paste line…",
-            command=lambda: self._paste_line(entry),
-            bg=ACCENT2, fg=WHITE, activebackground=ACCENT, activeforeground=WHITE,
-            relief=tk.FLAT, cursor="hand2", font=(FONT, 8, "bold"), padx=6,
-        ).pack(side=tk.LEFT, padx=(4, 0))
+        self._button(
+            line1b, "Paste line…", lambda: self._paste_line(entry),
+            font=(FONT, 8, "bold"),
+        ).grid(row=0, column=1, sticky="ew", padx=(3, 0))
 
         line2 = tk.Frame(row, bg=BG2)
         line2.pack(fill=tk.X, padx=4, pady=(0, 3))
@@ -1853,10 +1983,9 @@ class GGModUI:
         entry = {"row": row, **entry_vars}
         # Auto-calculate the instruction-aligned steal length from the AOB via
         # capstone. Fills the steal field; the user can still override it.
-        tk.Button(
-            line2, text="Auto", command=lambda: self._auto_steal(entry),
-            bg=ACCENT2, fg=WHITE, activebackground=ACCENT, activeforeground=WHITE,
-            relief=tk.FLAT, cursor="hand2", font=(FONT, 8, "bold"), padx=6,
+        self._button(
+            line2, "Auto", lambda: self._auto_steal(entry),
+            font=(FONT, 8, "bold"), padx=6,
         ).pack(side=tk.LEFT, padx=(4, 0))
         self._label(line2, "reg:", fg=MUTED, bg=BG2).pack(side=tk.LEFT, padx=(8, 2))
         ttk.Combobox(line2, textvariable=entry_vars["register"], values=REGISTERS,
@@ -1955,7 +2084,8 @@ class GGModUI:
                 "region — double-check it disassembled correctly.".format(steal))
         self.log(msg)
 
-    def _from_address(self, entry, prefill_address=None, auto_read=False):
+    def _from_address(self, entry, prefill_address=None, auto_read=False,
+                      offset_var=_USE_STRUCT_OFFSET):
         """Dialog: read a live address, disassemble, and auto-fill the hook.
 
         Reuses engine.build_candidate_from_address (capstone + scan_aob). The
@@ -1967,28 +2097,40 @@ class GGModUI:
         change any matching/auto-fill behaviour below. `auto_read` additionally
         presses Read for you (used by Find Writes, where the address came from
         a captured hit so there is nothing for the user to type). Neither flag
-        auto-fills the form: "Fill fields" stays an explicit click."""
+        auto-fills the form: "Fill fields" stays an explicit click.
+
+        `offset_var`: which StringVar receives the decoded struct_offset (the
+        memory operand's displacement, e.g. the "18" in "mov [ebx+18],edi").
+        Defaults to self.form_vars["struct_offset"] (pointer_capture's hook
+        rows). hard_freeze has no struct_offset concept -- its "Offset" field
+        is a different quantity (a byte position within the AOB match,
+        computed by the Auto-steal button, not this dialog) -- so the wiring
+        for hard_freeze's AOB row passes offset_var=None to skip filling any
+        offset field at all, leaving only the AOB copied over.
+        """
+        resolved_offset_var = (self.form_vars["struct_offset"]
+                               if offset_var is _USE_STRUCT_OFFSET else offset_var)
         self.form_error_var.set("")
         if not self.engine.is_attached():
             self.form_error_var.set(
                 "Attach to the game first — 'From address' reads live memory.")
             return
 
-        top = tk.Toplevel(self.root)
-        top.title("Build hook from address")
-        top.configure(bg=BG)
-        top.transient(self.root)
-        top.grab_set()
+        top = self._dialog("Build hook from address", minsize=(520, 380))
 
         head = tk.Frame(top, bg=BG)
         head.pack(fill=tk.X, padx=12, pady=(12, 4))
-        self._label(head, "Address (hex, from Cheat Engine):", fg=MUTED).pack(side=tk.LEFT)
+        head.columnconfigure(1, weight=1)
+        self._label(head, "Address (hex, from Cheat Engine):", fg=MUTED).grid(
+            row=0, column=0, sticky="w")
         addr_var = tk.StringVar(value=prefill_address or "")
         addr_entry = self._entry(head, addr_var, width=18)
-        addr_entry.pack(side=tk.LEFT, padx=(6, 6))
+        addr_entry.grid(row=0, column=1, sticky="ew", padx=6)
         addr_entry.focus_set()
         if prefill_address:
             addr_entry.select_range(0, tk.END)   # pre-filled + selected, ready to Read
+        read_btn = self._button(head, "Read", lambda: _read())
+        read_btn.grid(row=0, column=2, sticky="e")
 
         result_txt = tk.Text(top, width=64, height=12, bg=BG3, fg=FG, relief=tk.FLAT,
                              wrap=tk.NONE, font=(MONO, 9), state=tk.DISABLED)
@@ -2059,8 +2201,10 @@ class GGModUI:
                 entry["register"].set(res["capture_register"])
             if res.get("module"):
                 entry["module"].set(res["module"])
-            if res.get("struct_offset") is not None:
-                self.form_vars["struct_offset"].set(res["struct_offset"])
+            filled_offset = False
+            if resolved_offset_var is not None and res.get("struct_offset") is not None:
+                resolved_offset_var.set(res["struct_offset"])
+                filled_offset = True
             # Pre-select + surface the advisory jmp type (user can still change).
             sug = state.get("suggest")
             if sug:
@@ -2071,13 +2215,12 @@ class GGModUI:
                 "From address: filled AOB ({} match(es)){}{}.".format(
                     res.get("matches"),
                     ", reg=" + res["capture_register"] if res.get("capture_register") else "",
-                    ", offset=" + res["struct_offset"] if res.get("struct_offset") is not None else "",
+                    ", offset=" + res["struct_offset"] if filled_offset else "",
                 ))
             top.destroy()
 
         btns = tk.Frame(top, bg=BG)
         btns.pack(fill=tk.X, padx=12, pady=(0, 12))
-        self._button(head, "Read", _read).pack(side=tk.LEFT)
         addr_entry.bind("<Return>", lambda _e: _read())
         fill_btn = self._button(btns, "Fill fields", _fill)
         fill_btn.pack(side=tk.LEFT)
@@ -2089,16 +2232,19 @@ class GGModUI:
         if auto_read and prefill_address:
             top.after(0, _read)
 
-    def _paste_line(self, entry):
+    def _paste_line(self, entry, offset_var=_USE_STRUCT_OFFSET):
         """Offline dialog: paste a disassembly line, fill register + offset.
 
         Pure text parse (engine.parse_disasm_line) — needs no attached process.
-        Does NOT touch the AOB (supply that via CE / From address / by hand)."""
-        top = tk.Toplevel(self.root)
-        top.title("Paste disassembly line")
-        top.configure(bg=BG)
-        top.transient(self.root)
-        top.grab_set()
+        Does NOT touch the AOB (supply that via CE / From address / by hand).
+
+        `offset_var`: see _from_address -- defaults to
+        self.form_vars["struct_offset"]; pass None (as hard_freeze's AOB row
+        does) to skip filling any offset field, since hard_freeze's "Offset"
+        is a different quantity than a struct-member displacement."""
+        resolved_offset_var = (self.form_vars["struct_offset"]
+                               if offset_var is _USE_STRUCT_OFFSET else offset_var)
+        top = self._dialog("Paste disassembly line", minsize=(460, 280))
 
         self._label(top, "Paste a line from Cheat Engine (e.g. "
                     "\"0053FBBA - 89 7B 18 - mov [ebx+18],edi\"):",
@@ -2146,9 +2292,14 @@ class GGModUI:
             if not res:
                 return
             entry["register"].set(res["capture_register"])
-            self.form_vars["struct_offset"].set(res["struct_offset"])
-            self.log("Paste line: register={}, struct_offset={} (AOB unchanged).".format(
-                res["capture_register"], res["struct_offset"]))
+            filled_offset = False
+            if resolved_offset_var is not None:
+                resolved_offset_var.set(res["struct_offset"])
+                filled_offset = True
+            self.log("Paste line: register={}{} (AOB unchanged).".format(
+                res["capture_register"],
+                ", struct_offset={}".format(res["struct_offset"])
+                if filled_offset else ""))
             top.destroy()
 
         btns = tk.Frame(top, bg=BG)
@@ -2179,7 +2330,7 @@ class GGModUI:
 
         visible = {"name", "template", "notes"}  # notes: optional, both templates
         if hard:
-            visible |= {"aob", "offset", "freeze_mode"}  # single flat AOB
+            visible |= {"aob", "aob_tools", "offset", "freeze_mode"}  # single flat AOB
             if freeze_mode == "value":
                 visible.add("value")
             else:
@@ -2347,11 +2498,7 @@ class GGModUI:
 
     def on_new_game(self):
         """Dialog to create a fresh empty game config in games/."""
-        top = tk.Toplevel(self.root)
-        top.title("New Game")
-        top.configure(bg=BG)
-        top.transient(self.root)
-        top.grab_set()
+        top = self._dialog("New Game", minsize=(360, 220))
 
         name_var = tk.StringVar()
         proc_var = tk.StringVar()
@@ -2665,16 +2812,13 @@ class GGModUI:
     def _show_note_popup(self, mod):
         """Read-only popup showing a mod's notes (click on the '!' indicator)."""
         self._hide_tip()
-        top = tk.Toplevel(self.root)
-        top.title("Notes - {}".format(mod.get("name", "")))
-        top.configure(bg=BG)
-        top.transient(self.root)
-        top.grab_set()
+        top = self._dialog("Notes - {}".format(mod.get("name", "")),
+                           minsize=(360, 220))
         self._label(top, "Notes for '{}':".format(mod.get("name")),
                     fg=ACCENT, font=(FONT, 10, "bold")).pack(anchor="w", padx=12, pady=(12, 6))
         txt = tk.Text(top, width=52, height=8, bg=BG3, fg=FG, relief=tk.FLAT,
                       wrap=tk.WORD, font=(FONT, 9))
-        txt.pack(padx=12, pady=4)
+        txt.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
         txt.insert("1.0", mod.get("notes", ""))
         txt.config(state=tk.DISABLED)
         self._button(top, "Close", top.destroy).pack(pady=(4, 12))
@@ -2710,16 +2854,13 @@ class GGModUI:
             self.log("Select a mod first to edit its notes.")
             return
 
-        top = tk.Toplevel(self.root)
-        top.title("Edit Notes - {}".format(mod.get("name", "")))
-        top.configure(bg=BG)
-        top.transient(self.root)
-        top.grab_set()
+        top = self._dialog("Edit Notes - {}".format(mod.get("name", "")),
+                           minsize=(360, 220))
         self._label(top, "Notes for '{}':".format(mod.get("name")),
                     fg=ACCENT, font=(FONT, 10, "bold")).pack(anchor="w", padx=10, pady=(10, 4))
         txt = tk.Text(top, width=54, height=8, bg=BG3, fg=FG, insertbackground=FG,
                       relief=tk.SOLID, bd=1, wrap=tk.WORD, font=(FONT, 9))
-        txt.pack(padx=10, pady=4)
+        txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
         txt.insert("1.0", mod.get("notes", ""))
         txt.focus_set()
 
@@ -2737,7 +2878,7 @@ class GGModUI:
             self.show_details(mod)
 
         self._button(row, "Save", _save).pack(side=tk.LEFT, padx=4)
-        self._button(row, "Cancel", top.destroy).pack(side=tk.LEFT, padx=4)
+        self._button_ghost(row, "Cancel", top.destroy).pack(side=tk.LEFT, padx=4)
 
     # ==================================================================
     # Edit / Delete existing mods
