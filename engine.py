@@ -15,6 +15,7 @@ comments and surfaced via the log callback.
 
 import ctypes
 import json
+import os
 import queue
 import re
 import struct
@@ -2887,6 +2888,119 @@ class THREADENTRY32(ctypes.Structure):
         ("tpDeltaPri", ctypes.c_long),
         ("dwFlags", wintypes.DWORD),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Process picker support: enumerate running processes that look like "a
+# program the user is running" (visible top-level window), for the Attach
+# process picker in the UI. Kept here alongside the other Toolhelp32 code.
+# ---------------------------------------------------------------------------
+TH32CS_SNAPPROCESS = 0x00000002
+_MAX_PATH = 260
+
+
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", ctypes.c_wchar * _MAX_PATH),
+    ]
+
+
+_kernel32.Process32FirstW.restype = wintypes.BOOL
+_kernel32.Process32FirstW.argtypes = [wintypes.HANDLE,
+                                      ctypes.POINTER(PROCESSENTRY32W)]
+_kernel32.Process32NextW.restype = wintypes.BOOL
+_kernel32.Process32NextW.argtypes = [wintypes.HANDLE,
+                                     ctypes.POINTER(PROCESSENTRY32W)]
+
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
+_user32.IsWindowVisible.restype = wintypes.BOOL
+_user32.IsWindowVisible.argtypes = [wintypes.HWND]
+_user32.GetWindow.restype = wintypes.HWND
+_user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+_user32.GetWindowTextLengthW.restype = ctypes.c_int
+_user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+_user32.GetWindowTextW.restype = ctypes.c_int
+_user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+_user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+_user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
+                                             ctypes.POINTER(wintypes.DWORD)]
+_EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+_user32.EnumWindows.restype = wintypes.BOOL
+_user32.EnumWindows.argtypes = [_EnumWindowsProc, wintypes.LPARAM]
+
+GW_OWNER = 4
+
+
+def _snapshot_process_names():
+    """pid -> exe filename (e.g. 'GTA5_Enhanced.exe'), via a full process
+    snapshot. Unlike an OpenProcess-based name query, this works even for
+    processes GGMod doesn't have access rights to open."""
+    names = {}
+    snap = _kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == _INVALID_HANDLE_VALUE:
+        return names
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = _kernel32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            names[entry.th32ProcessID] = entry.szExeFile
+            ok = _kernel32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        _kernel32.CloseHandle(snap)
+    return names
+
+
+def list_visible_processes():
+    """List running processes that own at least one visible, unowned
+    top-level window with a title -- i.e. things a user would recognise as
+    "a running program", cutting out background services/helpers. GGMod's
+    own process is always excluded.
+
+    Returns a list of dicts: {"pid": int, "exe": str, "title": str}, one
+    entry per process (first matching window title wins), sorted by title.
+    """
+    self_pid = os.getpid()
+    titles = {}  # pid -> first visible top-level window title
+
+    def _callback(hwnd, _lparam):
+        if not _user32.IsWindowVisible(hwnd):
+            return True
+        if _user32.GetWindow(hwnd, GW_OWNER):
+            return True  # an owned window (e.g. a dialog), not a top-level app
+        length = _user32.GetWindowTextLengthW(hwnd)
+        if length == 0:
+            return True
+        buf = ctypes.create_unicode_buffer(length + 1)
+        _user32.GetWindowTextW(hwnd, buf, length + 1)
+        title = buf.value.strip()
+        if not title:
+            return True
+        pid = wintypes.DWORD()
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value and pid.value != self_pid and pid.value not in titles:
+            titles[pid.value] = title
+        return True
+
+    _user32.EnumWindows(_EnumWindowsProc(_callback), 0)
+
+    exe_names = _snapshot_process_names()
+    results = [
+        {"pid": pid, "exe": exe_names[pid], "title": title}
+        for pid, title in titles.items()
+        if pid in exe_names
+    ]
+    results.sort(key=lambda r: r["title"].lower())
+    return results
 
 
 class EXCEPTION_RECORD(ctypes.Structure):

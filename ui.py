@@ -57,6 +57,11 @@ GAMES_DIR = os.path.join(_APP_DIR, "games")
 # Small local settings file (scan-hotkey bindings) so they survive a restart.
 SETTINGS_PATH = os.path.join(_APP_DIR, "ggmod_settings.json")
 
+# Placeholder entry always shown first in the Game dropdown, so the user can
+# get back to a "nothing loaded" state after having selected a real config
+# (the dropdown would otherwise never return to empty on its own).
+NO_GAME_LABEL = "-- none --"
+
 # Value-Scanner global hotkey actions. The action key doubles as the Next Scan
 # scan_type passed to the scanner, so no extra mapping is needed.
 SCAN_HOTKEY_ACTIONS = [
@@ -3129,15 +3134,24 @@ class GGModUI:
     def refresh_game_list(self):
         paths = sorted(glob.glob(os.path.join(GAMES_DIR, "*.json")))
         names = [os.path.basename(p) for p in paths]
-        self.game_combo["values"] = names
+        # Rebuilt fresh from the glob every call, so the placeholder is never
+        # duplicated no matter how many times this runs.
+        self.game_combo["values"] = [NO_GAME_LABEL] + names
         self.log("Found {} game config(s) in {}/.".format(len(names), GAMES_DIR))
 
-    def on_new_game(self):
-        """Dialog to create a fresh empty game config in games/."""
+    def on_new_game(self, prefill_process=None, auto_attach=False):
+        """Dialog to create a fresh empty game config in games/.
+
+        `prefill_process`/`auto_attach` let the Attach process picker reuse
+        this same dialog when a picked process doesn't match any existing
+        config: the exe name is pre-filled and, once the config is saved,
+        we attach to it immediately instead of leaving the user to click
+        Attach again.
+        """
         top = self._dialog("New Game", minsize=(360, 220))
 
         name_var = tk.StringVar()
-        proc_var = tk.StringVar()
+        proc_var = tk.StringVar(value=prefill_process or "")
         err_var = tk.StringVar()
 
         form = tk.Frame(top, bg=BG)
@@ -3191,6 +3205,8 @@ class GGModUI:
             self.refresh_game_list()
             self.game_var.set(stem + ".json")
             self._load_config(path)
+            if auto_attach:
+                self._do_attach(proc)
 
         btns = tk.Frame(top, bg=BG)
         btns.pack(pady=(4, 14))
@@ -3199,9 +3215,39 @@ class GGModUI:
 
     def on_game_selected(self, _event=None):
         name = self.game_var.get()
-        if not name:
+        if not name or name == NO_GAME_LABEL:
+            self._clear_config()
             return
         self._load_config(os.path.join(GAMES_DIR, name))
+
+    def _clear_config(self):
+        """Reset to the same 'nothing loaded' state the app starts in --
+        used when the user picks the blank/placeholder dropdown entry, so
+        Attach's no-config-selected branch (the process picker) is reachable
+        again after a real config was previously loaded."""
+        if self.engine.is_attached():
+            if not messagebox.askyesno(
+                "Switch game",
+                "Currently attached to '{}'. Detach before clearing the "
+                "loaded config?".format(self.engine.process_name),
+            ):
+                self.log("Config clear cancelled (still attached).")
+                # Leave the dropdown showing the config that's actually loaded.
+                self.game_var.set(
+                    os.path.basename(self.config_path) if self.config_path else "")
+                return
+            self.on_detach()
+
+        self.config_raw = {}
+        self.config_path = None
+        self.engine.mods = []
+        self.engine.config_path = None
+        self.engine.config_data = None
+        self.game_var.set("")
+        self.selected_mod = None
+        self._reset_preview_display()
+        self.refresh_mod_list()
+        self._register_config_hotkeys()  # clears the previous config's bindings
 
     def on_browse_config(self):
         path = filedialog.askopenfilename(
@@ -3245,12 +3291,27 @@ class GGModUI:
     # Attach / detach
     # ==================================================================
     def on_attach(self):
+        # No config loaded (dropdown empty) -> let the user pick a running
+        # process instead of prompting blind. Otherwise, fall back to the
+        # existing text-prompt flow, defaulted to the loaded config's exe.
+        if not self.game_var.get():
+            self.on_pick_process()
+            return
+        self._attach_via_prompt()
+
+    def _attach_via_prompt(self):
         default = self.config_raw.get("process_name", "") if self.config_raw else ""
         process_name = simpledialog.askstring(
             "Attach", "Process name:", initialvalue=default, parent=self.root
         )
         if not process_name:
             return
+        self._do_attach(process_name)
+
+    def _do_attach(self, process_name):
+        """Shared attach + status-message logic, used by every Attach path
+        (text prompt, process picker match, New Game auto-attach) so the
+        success/failure messaging is always identical."""
         if self.engine.attach(process_name):
             self.status_var.set("● Attached to {}".format(process_name))
             self.status_label.config(fg=GREEN)
@@ -3260,6 +3321,100 @@ class GGModUI:
         self.refresh_mod_list()
         self._apply_scan_hotkeys()   # activate scan hotkeys now attached (if on)
         self._update_scan_auto()     # resume live refresh if toggle still on
+
+    def on_pick_process(self):
+        """Attach clicked with no game config selected: list running
+        processes that own a visible top-level window, let the user pick
+        one, then either load the matching games/*.json config and attach,
+        or fall through to New Game (pre-filled) if nothing matches."""
+        top = self._dialog("Attach - Pick a process", minsize=(460, 360))
+
+        self._label(top, "Select the running game:", fg=MUTED,
+                    font=(FONT, 9, "bold")).pack(anchor="w", padx=14, pady=(14, 4))
+
+        list_frame = tk.Frame(top, bg=BG)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=14)
+        tree = ttk.Treeview(list_frame, columns=("exe",), show="tree headings",
+                            height=10)
+        tree.heading("#0", text="Window title")
+        tree.heading("exe", text="Process")
+        tree.column("#0", width=260)
+        tree.column("exe", width=160)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=tree.yview)
+        scroll.pack(side=tk.LEFT, fill=tk.Y)
+        tree.configure(yscrollcommand=scroll.set)
+
+        err_var = tk.StringVar()
+        self._label(top, "", fg=AMBER, textvariable=err_var, wraplength=420,
+                    justify="left").pack(anchor="w", padx=14, pady=(4, 0))
+
+        def _populate():
+            tree.delete(*tree.get_children())
+            try:
+                procs = engine.list_visible_processes()
+            except Exception as exc:
+                err_var.set("Could not list processes: {}".format(exc))
+                return
+            if not procs:
+                err_var.set(
+                    "No running windows detected (some fullscreen/borderless "
+                    "games don't register one). Use 'Type process name "
+                    "instead' below."
+                )
+            else:
+                err_var.set("")
+            for proc in procs:
+                tree.insert("", "end", iid=str(proc["pid"]), text=proc["title"],
+                            values=(proc["exe"],))
+
+        def _confirm(_event=None):
+            sel = tree.selection()
+            if not sel:
+                err_var.set("Select a process first.")
+                return
+            exe = tree.set(sel[0], "exe")
+            top.destroy()
+            self._attach_from_picked_exe(exe)
+
+        def _manual():
+            top.destroy()
+            self._attach_via_prompt()
+
+        tree.bind("<Double-1>", _confirm)
+
+        btns = tk.Frame(top, bg=BG)
+        btns.pack(pady=(8, 14))
+        self._button(btns, "Select", _confirm).pack(side=tk.LEFT, padx=4)
+        self._button_ghost(btns, "Refresh", _populate).pack(side=tk.LEFT, padx=4)
+        self._button_ghost(btns, "Type process name instead", _manual).pack(
+            side=tk.LEFT, padx=4)
+        self._button_ghost(btns, "Cancel", top.destroy).pack(side=tk.LEFT, padx=4)
+
+        _populate()
+
+    def _attach_from_picked_exe(self, exe_name):
+        """Match the picked exe against games/*.json's stored process_name.
+        A match loads that config and attaches immediately; no match opens
+        New Game pre-filled with the exe name and auto-attaches on save."""
+        match_path = None
+        for path in sorted(glob.glob(os.path.join(GAMES_DIR, "*.json"))):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    cfg = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if cfg.get("process_name", "").strip().lower() == exe_name.strip().lower():
+                match_path = path
+                break
+
+        if match_path:
+            self.game_var.set(os.path.basename(match_path))
+            self._load_config(match_path)
+            self._do_attach(exe_name)
+        else:
+            self.log("No config matches '{}' - opening New Game.".format(exe_name))
+            self.on_new_game(prefill_process=exe_name, auto_attach=True)
 
     def on_detach(self):
         if not self.engine.is_attached():
