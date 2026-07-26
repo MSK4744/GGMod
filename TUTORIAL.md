@@ -81,7 +81,40 @@ Click the **Add Mod** tab and fill in:
 - **Template** — choose based on what you found:
   - **`hard_freeze`** if there's a single write instruction you want to just skip entirely (e.g. a value that only ever decreases, and you never need the game to legitimately spend it)
   - **`pointer_capture`** if you want ongoing control over the value (never let it drop below X, always hard-set it to X, or you found multiple write paths that need to share one hook)
-- **AOB** — the bytes you gathered in Part 1, Step 5
+  - **`pointer_chain`** if the **Pointer Chains** tool found a static `module_base + offset` path to your target — see "Choosing `pointer_chain` vs `pointer_capture`" below
+- **AOB** — the bytes you gathered in Part 1, Step 5 (`hard_freeze`/`pointer_capture` only — `pointer_chain` has no AOB at all)
+
+### Choosing `pointer_chain` vs `pointer_capture`
+
+Both templates end up doing the same thing — reading/writing a live game object's memory every poll tick — but they get there differently, and one is strictly less hassle when it's available:
+
+- **`pointer_chain`** resolves `module_base + base_offset`, walks a fixed list of pointer offsets, and reads/writes whatever address that lands on — directly, every tick. There's no hook, no code cave, and nothing to trigger in-game: the moment you Apply, the mod is live. **Live-verified**: Preview reported `status: ready` immediately after Attach, before performing the in-game action the value is tied to — there is genuinely no trigger step. The catch is you first need the **Pointer Chains** window to actually find a chain that survives a game restart (not every object has one within a reasonable search depth).
+- **`pointer_capture`** installs a hook on an instruction that writes the value, and only starts working once that instruction actually executes in-game (e.g. you have to take damage once before "never decrease" has anything to enforce). Preview stays `blocked` until then. It has no dependency on finding a static chain — it works as long as you can find *any* instruction that touches the value — but it needs that one trigger, and it patches code (a hook + a cave) rather than just reading/writing data.
+
+Rule of thumb: **try Pointer Chains first** (Tools → Pointer Chains, or the "Open Pointer Chains…" shortcut on the Add Mod tab) if you want a mod that's immediately active with no setup dance in-game. Fall back to `pointer_capture` when no chain survives a restart within a reasonable search depth, or when you've already found a clean write instruction and don't need the extra step.
+
+For `pointer_chain` specifically:
+- **Module** — leave blank for the main game .exe, or name a specific module (e.g. a Unity/IL2CPP `GameAssembly.dll`)
+- **Base offset** — the fixed offset from the module's base address, in hex (e.g. `DA5358` for `0xDA5358`)
+- **Offset chain** — the list of pointer offsets to walk, in hex, comma-separated (e.g. `58` for a single-hop chain, or `58, 10` for two hops). **Every entry here is dereferenced**: at each hop, GGMod reads whatever pointer value lives at `current_address + offset` and uses *that* as the next `current_address`, all the way down to the last entry — which is also dereferenced and used as the next hop's address, unless it's the *only* remaining thing to resolve, in which case its sum is returned as the resolved pointer. In short: this is a real multi-level pointer chain, exactly the kind CE's pointer scan (and GGMod's **Pointer Chains** window) discovers, where every intermediate address genuinely holds another pointer. The **Pointer Chains** window fills this in for you automatically via "Use for New Mod" — you shouldn't normally need to type it by hand.
+- **Struct offset** *(optional, hex)* — a **flat** displacement added on top of `offset_chain`'s resolved pointer, with **no further dereference**. This is the same field `pointer_capture` uses, and it means the same thing here: use it when `offset_chain` lands you on a container **object's base address**, and the value you actually want to poll is a data field sitting at a fixed byte offset *inside* that object — not another pointer to hop through. Leave it blank (or `0`) if `offset_chain`'s last hop already reaches the target field directly.
+  - **Do not** fold a struct-field offset into `offset_chain` as an extra entry — GGMod has no way to tell "this number is one more pointer hop" apart from "this number is a flat field offset," so it will dereference it like every other entry, which means reading the target object's own data as if it were a pointer. See the worked example and failure signature below.
+- **Poll mode** — the same options as `pointer_capture` (`never_decrease` / `clamp_min` / `hard_set` / `set_once`); the chain is re-walked fresh every tick, so if the target object is destroyed and recreated at a new address, the next tick just follows the pointer to wherever it lives now.
+
+#### Worked example: the Forgotten Sands "Rewind" charge counter
+
+`games/POP The Forgoten Sands.json` has two mods that both end up controlling the same in-game value, built two different ways — useful as a side-by-side reference:
+
+- **`pointer_capture` "Rewind"** hooks an instruction that puts the Rewind object's pointer in `ebx`, then polls `[ebx + 0x18]` (`struct_offset: "18"`) — `0x18` is the counter field's displacement inside that object.
+- **`pointer_chain` "Rewind (chain)"** reaches the *same* object without any hook at all: `base_offset: "DA5358"` + `offset_chain: ["58"]` resolves to the Rewind object's address directly (`0x16E3AF48` in the tested session — the container, confirmed live by Preview). `struct_offset: "18"` is then added flat on top, landing on `0x16E3AF60` — the exact same counter field `pointer_capture`'s `ebx + 0x18` reaches, just via a static chain instead of a runtime-captured register.
+
+This was live-verified end to end: **Force Set** wrote the counter correctly at the resolved address, and with `poll_mode: never_decrease`, the charge count did not drop after actually consuming a rewind charge in-game.
+
+**Failure signature to recognize:** if you mistakenly write this as `offset_chain: ["58", "18"]` instead of `offset_chain: ["58"]` + `struct_offset: "18"`, GGMod will treat `0x18` as *another hop* and try to dereference `0x16E3AF48` (the object's own address) as if it held a pointer — reading whatever raw field happens to live at its first 4 (or 8, on x64) bytes and using that garbage value as an address. The symptom is a **Force Set write failure at a nonsensical address**, e.g.:
+```
+force_set: 'Rewind (chain)' write failed: Could not write memory at: 16332056 (0xF93518), length: ... - GetLastError: 998
+```
+`GetLastError: 998` is Windows' "invalid access to memory location" — a strong hint the resolved address isn't a real object address at all, but a stray field value being misread as a pointer. If you see this, check whether the last `offset_chain` entry should actually be a `struct_offset` instead.
 
 For `pointer_capture` specifically:
 - **Struct offset** — the `+0x20` style offset you noted
@@ -99,7 +132,7 @@ For `hard_freeze` specifically:
 
 ### Step 3: Preview
 
-Click **Preview**. This runs a live, read-only scan of the game's memory and reports one of three outcomes:
+Click **Preview**. This runs a live, read-only check of the game's memory and reports one of three outcomes (for `pointer_chain`, there's no AOB to scan — Preview just walks the chain and shows what it currently resolves to, so only "ready" / "blocked (no match)" apply):
 
 - 🟢 **Ready** — exactly one match found. Shows the matched address and original bytes. You're clear to Apply.
 - 🔴 **Blocked (no match)** — zero matches. Your AOB is wrong, stale (game got updated), or you copied bytes from the wrong module. Double check your bytes against Cheat Engine.

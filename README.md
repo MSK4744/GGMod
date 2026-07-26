@@ -28,6 +28,7 @@ GGMod scans the running process for that pattern, verifies it's unique, and (dep
 
 - **`hard_freeze`** — NOPs a specific write instruction, so the value it would have written is skipped entirely. Good for values with one write path you want to permanently prevent (like a decrement).
 - **`pointer_capture`** — installs a code cave hook at one or more write sites that all funnel into a shared object pointer. Once captured, GGMod can poll and enforce a value (never decrease, clamp minimum, hard-set every tick) independent of how many different code paths write to it.
+- **`pointer_chain`** — no hook at all: resolves `module_base + base_offset`, walks a fixed list of pointer offsets (found via the Pointer Chains tool's static pointer scan, each one dereferenced hop-by-hop), then optionally adds a flat `struct_offset` on top with no further dereference — the same struct-field semantics `pointer_capture` uses, for reaching a data field inside whatever object the chain resolves to. Immediately active on Apply — there's no in-game trigger to fire first — but only works when a chain that survives a restart can actually be found.
 
 ### Safety features
 

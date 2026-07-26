@@ -29,6 +29,11 @@ try:
 except Exception:                       # capstone is optional at import time
     capstone = None                     # auto-steal helpers raise if it's absent
 
+try:
+    import numpy as np
+except Exception:                       # numpy is optional at import time
+    np = None                           # PointerChainFinder errors if it's absent
+
 # ---------------------------------------------------------------------------
 # Win32 bindings we need beyond what pymem exposes conveniently.
 # ---------------------------------------------------------------------------
@@ -850,6 +855,32 @@ class TrainerEngine:
             pass
         return None, 0, 0
 
+    def _iter_committed(self):
+        """Walk the whole address space via VirtualQueryEx, yielding (base,
+        size) of every committed, readable (non-guard/non-noaccess) region --
+        heap/stack included, not just module images. Shared by MemoryScanner
+        (region='All' value scans) and PointerChainFinder (the static
+        pointer-scan snapshot, which specifically needs off-module memory
+        since that's where object instances live) rather than duplicated."""
+        handle = self.pm.process_handle
+        max_addr = 0x7FFFFFFFFFFF if self._is64 else 0x7FFFFFFF
+        addr = 0
+        mbi = MEMORY_BASIC_INFORMATION()
+        while addr < max_addr:
+            if not _kernel32.VirtualQueryEx(
+                    handle, ctypes.c_void_p(addr),
+                    ctypes.byref(mbi), ctypes.sizeof(mbi)):
+                break
+            base = mbi.BaseAddress or 0
+            size = mbi.RegionSize or 0
+            if size == 0:
+                break
+            prot = mbi.Protect
+            if (mbi.State == MEM_COMMIT and prot not in (0, PAGE_NOACCESS)
+                    and not (prot & PAGE_GUARD)):
+                yield base, size
+            addr = base + size
+
     def build_candidate_from_address(self, address, byte_span=32):
         """Read live bytes at `address`, disassemble, and build a hook candidate
         for the Add Mod form: a unique AOB plus best-effort register/offset.
@@ -1197,6 +1228,9 @@ class TrainerEngine:
             self._preview_pointer_capture(mod, result,
                                           progress_callback=progress_callback)
 
+        elif template == "pointer_chain":
+            self._preview_pointer_chain(mod, result)
+
         else:
             result["status"] = "blocked_unknown_template"
             result["warnings"].append("unknown template: {}".format(template))
@@ -1280,6 +1314,78 @@ class TrainerEngine:
         result["matches"] = total_matches
         result["status"] = "ready" if overall_ready else "blocked_hooks"
 
+    def _resolve_pointer_chain(self, base, offset_chain):
+        """Walk offset_chain from `base` (already module_base + base_offset),
+        one pointer read per hop -- the same arithmetic as
+        PointerChainFinder.resolve_chain, but taking an already-resolved
+        module base so callers (preview + the poll loop) don't re-enumerate
+        process modules on every call. The LAST offset is added but not
+        dereferenced again -- it IS the resolved pointer, matching
+        resolve_chain's convention (every offset_chain entry is a real hop;
+        that's what makes a chain from find_pointer_chains resolve correctly
+        at every level). This function does NOT know about struct_offset --
+        callers that need a flat field displacement on top of this result
+        (apply_pointer_chain, _preview_pointer_chain, force_set_value via
+        _effective_ptr) add it themselves, exactly like pointer_capture adds
+        struct_offset to its captured pointer. Returns the resolved pointer,
+        or None if any hop's read fails (unreadable/decommitted -- e.g. the
+        object doesn't exist yet, or the process is mid-load)."""
+        ptr_size = 8 if self._is64 else 4
+        fmt = "<Q" if ptr_size == 8 else "<I"
+        addr = base
+        for off in offset_chain:
+            raw = self._read(addr, ptr_size)
+            if not raw or len(raw) != ptr_size:
+                return None
+            ptr = struct.unpack(fmt, raw)[0]
+            addr = ptr + off
+        return addr
+
+    def _preview_pointer_chain(self, mod, result):
+        """Fill result with the chain's currently-resolved address.
+
+        Unlike hard_freeze/pointer_capture, there is no AOB to scan and no
+        "multiple matches" possibility -- a pointer chain either resolves
+        (every hop reads a valid pointer) or it doesn't. status is 'ready'
+        only when every hop read succeeds.
+
+        offset_chain resolves to a POINTER (every entry in it is a real hop
+        that gets dereferenced, except the very last add -- see
+        _resolve_pointer_chain). struct_offset, if given, is then added FLAT
+        on top with NO further dereference -- exactly pointer_capture's
+        struct_offset semantics, for reaching a data field inside whatever
+        object offset_chain resolves to (see apply_pointer_chain's docstring
+        for why this is a separate field rather than one more offset_chain
+        entry).
+        """
+        module = mod.get("module")
+        offset_chain = [_parse_offset(o) for o in mod.get("offset_chain") or []]
+        if not offset_chain:
+            result["status"] = "blocked_no_match"
+            result["warnings"].append("offset_chain is empty")
+            return
+        base, size = self._main_module_range(module)
+        if not size:
+            result["status"] = "blocked_no_match"
+            result["warnings"].append(
+                "module '{}' not found in the current process.".format(
+                    module or "main module"))
+            return
+        base_offset = _parse_offset(mod.get("base_offset"))
+        addr = self._resolve_pointer_chain(base + base_offset, offset_chain)
+        if addr is None:
+            result["status"] = "blocked_no_match"
+            result["warnings"].append(
+                "could not read a pointer somewhere along the chain -- "
+                "the chain may not have survived a restart/update.")
+            return
+        struct_offset = _parse_offset(mod.get("struct_offset", 0))
+        addr += struct_offset
+        result["matches"] = 1
+        result["match_addresses"] = ["0x{:X}".format(addr)]
+        result["resolved_address"] = "0x{:X}".format(addr)
+        result["status"] = "ready"
+
     # ==================================================================
     # APPLY  (dispatch + gate)
     # ==================================================================
@@ -1299,6 +1405,8 @@ class TrainerEngine:
             return self.apply_hard_freeze(mod)
         if template == "pointer_capture":
             return self.apply_pointer_capture(mod)
+        if template == "pointer_chain":
+            return self.apply_pointer_chain(mod)
         self._log("Unknown template for '{}'.".format(mod.get("name")))
         return False
 
@@ -1645,6 +1753,116 @@ class TrainerEngine:
         )
         return True
 
+    # ==================================================================
+    # TEMPLATE: pointer_chain
+    # ==================================================================
+    def apply_pointer_chain(self, mod):
+        """Poll [module_base + base_offset -> ...offset_chain] (+struct_offset)
+        directly -- no hook, no code cave, no capture event.
+
+        offset_chain is a real multi-hop pointer chain: every entry except the
+        last is dereferenced (its sum is itself a pointer slot to read), and
+        the last entry's sum is returned as-is -- see _resolve_pointer_chain
+        and PointerChainFinder.find_pointer_chains' docstring for why (a
+        chain discovered via the Pointer Chains window has this shape at
+        every level; changing that would break genuine multi-level chains).
+
+        struct_offset is a SEPARATE, optional flat displacement (default 0)
+        applied AFTER offset_chain resolves, with NO further dereference --
+        exactly pointer_capture's struct_offset semantics. This is what you
+        want when offset_chain lands on an object's base address and the
+        actual field to poll is a fixed byte offset inside that object (a
+        real field holding data, not another pointer to hop through): put
+        the object-reaching hops in offset_chain and the field's displacement
+        in struct_offset, rather than appending it to offset_chain as a fake
+        extra hop -- that would make _resolve_pointer_chain dereference the
+        object's own bytes as if they were a pointer, reading garbage.
+
+        The module base is resolved ONCE here (not re-enumerated every poll
+        tick -- list_modules() is comparatively expensive to call 20x/sec).
+        The offset_chain itself IS re-walked every tick (cheap: one pointer
+        read per hop) rather than caching the resolved address -- unlike a
+        captured pointer, a chain has no "trigger" telling us when to
+        refresh, and re-walking is exactly what makes it self-healing if the
+        target object is destroyed and recreated at a new address but the
+        chain leading to it is still structurally valid. A hop read failing
+        (object not currently alive) just skips that tick's write.
+        """
+        name = mod.get("name")
+        module = mod.get("module")
+        offset_chain = [_parse_offset(o) for o in mod.get("offset_chain") or []]
+        if not offset_chain:
+            self._log("pointer_chain '{}': offset_chain is empty. Aborting.".format(name))
+            return False
+        base, size = self._main_module_range(module)
+        if not size:
+            self._log("pointer_chain '{}': module '{}' not found. Aborting.".format(
+                name, module or "main module"))
+            return False
+        base_offset = _parse_offset(mod.get("base_offset"))
+        chain_base = base + base_offset
+        struct_offset = _parse_offset(mod.get("struct_offset", 0))
+
+        def _resolve():
+            return self._resolve_pointer_chain(chain_base, offset_chain)
+
+        if _resolve() is None:
+            self._log(
+                "pointer_chain '{}': could not resolve the chain (a hop read "
+                "failed). Aborting.".format(name))
+            return False
+
+        poll_mode = mod.get("poll_mode", "never_decrease")
+        state = {"max": None, "value": _parse_int(mod.get("value"))}
+        stop = threading.Event()
+
+        def _loop():
+            while not stop.is_set():
+                try:
+                    addr = _resolve()
+                    if addr is not None:
+                        target = addr + struct_offset
+                        if poll_mode == "hard_set":
+                            self._write(target, struct.pack("<i", state["value"]))
+                        else:
+                            raw = self._read(target, 4)
+                            if raw:
+                                cur = struct.unpack("<i", raw)[0]
+                                if poll_mode == "never_decrease":
+                                    if state["max"] is None or cur > state["max"]:
+                                        state["max"] = cur
+                                    elif cur < state["max"]:
+                                        self._write(target, struct.pack("<i", state["max"]))
+                                elif poll_mode == "clamp_min":
+                                    floor = state["value"]
+                                    if cur < floor:
+                                        self._write(target, struct.pack("<i", floor))
+                                # "set_once" handled by set_once_trigger(), not here.
+                except Exception:
+                    pass
+                time.sleep(0.05)
+
+        thread = threading.Thread(target=_loop, daemon=True)
+        self._active[name] = {
+            "stop": stop, "thread": thread, "patches": [], "cave": None,
+            "kind": "pointer_chain",
+            # resolve_fn returns the raw offset_chain hop result (the
+            # "pointer"), NOT +struct_offset -- _effective_ptr returns it
+            # unchanged, and force_set_value/set_once_trigger already add
+            # entry["struct_offset"] themselves, exactly like pointer_capture.
+            "struct_offset": struct_offset, "ptr_size": 8 if self._is64 else 4,
+            "poll_mode": poll_mode, "state": state, "resolve_fn": _resolve,
+        }
+        if poll_mode != "set_once":
+            thread.start()
+        self._log(
+            "pointer_chain '{}' active: base {:#x}, offset_chain {}, "
+            "struct_offset {:#x}, mode {}.".format(
+                name, chain_base,
+                ["0x{:X}".format(o) for o in offset_chain], struct_offset,
+                poll_mode))
+        return True
+
     def _effective_ptr(self, entry):
         """The base pointer a write should target for an active mod.
 
@@ -1655,7 +1873,13 @@ class TrainerEngine:
         mods fall back to the live slot value, exactly as before.
 
         Returns (ptr, source) where source is 'locked_ptr' or 'slot' for logs.
+        pointer_chain mods have no slot at all -- their "pointer" IS the
+        freshly-resolved chain address (struct_offset is always 0 for them),
+        so this re-walks the chain via the stored resolve_fn instead.
         """
+        if entry.get("kind") == "pointer_chain":
+            addr = entry["resolve_fn"]()
+            return (addr or 0), "chain"
         state = entry.get("state") or {}
         if state.get("capture_once") and state.get("locked_ptr"):
             return state["locked_ptr"], "locked_ptr"
@@ -1747,8 +1971,9 @@ class TrainerEngine:
         if entry is None:
             self._log("force_set: '{}' is not active.".format(mod_name))
             return False
-        if entry.get("kind") != "pointer_capture":
-            self._log("force_set: '{}' is not a pointer_capture mod.".format(mod_name))
+        if entry.get("kind") not in ("pointer_capture", "pointer_chain"):
+            self._log("force_set: '{}' is not a pointer_capture/pointer_chain "
+                      "mod.".format(mod_name))
             return False
         try:
             value = int(value)
@@ -1925,25 +2150,12 @@ class MemoryScanner:
 
     def _iter_committed(self):
         """Walk the address space via VirtualQueryEx, yielding committed,
-        readable (non-guard/non-noaccess) regions."""
-        handle = self.engine.pm.process_handle
-        max_addr = 0x7FFFFFFFFFFF if self.engine._is64 else 0x7FFFFFFF
-        addr = 0
-        mbi = MEMORY_BASIC_INFORMATION()
-        while addr < max_addr:
-            if not _kernel32.VirtualQueryEx(
-                    handle, ctypes.c_void_p(addr),
-                    ctypes.byref(mbi), ctypes.sizeof(mbi)):
-                break
-            base = mbi.BaseAddress or 0
-            size = mbi.RegionSize or 0
-            if size == 0:
-                break
-            prot = mbi.Protect
-            if (mbi.State == MEM_COMMIT and prot not in (0, PAGE_NOACCESS)
-                    and not (prot & PAGE_GUARD)):
-                yield base, size
-            addr = base + size
+        readable (non-guard/non-noaccess) regions.
+
+        Delegates to TrainerEngine._iter_committed (shared with
+        PointerChainFinder) rather than duplicating the VirtualQueryEx loop.
+        """
+        yield from self.engine._iter_committed()
 
     def _read_chunks(self, base, size, overlap):
         """Yield (chunk_bytes, chunk_offset) covering [base, base+size), reading
@@ -2207,6 +2419,364 @@ class MemoryScanner:
             return True
         except Exception:
             return False
+
+
+# ---------------------------------------------------------------------------
+# Part D: Pointer Chain Finder -- automates CE's static pointer-scan.
+# ---------------------------------------------------------------------------
+# pointer_capture only captures a pointer while its hook instruction is
+# actively executing, so a mod is blind until the player triggers that code
+# path in-game. A static pointer chain -- module_base + fixed offsets, walked
+# fresh every time -- can be read the instant GGMod attaches instead. Finding
+# one is CE's classic two-phase algorithm:
+#   1. Snapshot every pointer-aligned value in committed memory ONCE (this is
+#      the expensive pass -- heap/stack included, not just module images,
+#      since that's where object instances actually live).
+#   2. Repeatedly binary-search that same snapshot (no further memory scans)
+#      for "what points near address X", walking backward from a known
+#      runtime address toward something in a module's static range.
+# Stage 1 (this section) is snapshot + a single binary-search level. Read-only
+# throughout, like MemoryScanner -- it never writes to the target, and
+# resolved chains are meant to be copied into a mod by hand, not auto-applied.
+class PointerChainFinder:
+    """Automates CE's static pointer-scan algorithm over a live process."""
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    def build_pointer_snapshot(self, progress_callback=None):
+        """One-time pass: read every committed, readable region and collect
+        every pointer-aligned slot whose value falls within the committed
+        address range observed during this same walk (a cheap garbage filter
+        -- most slots aren't pointers at all).
+
+        On a real process this is 10s-100s of MILLIONS of slots (valid heap/
+        stack pointers span nearly the whole address space, so the min/max
+        filter barely excludes anything) -- both the per-chunk filtering and
+        the final sort are vectorized with numpy rather than a Python loop +
+        list.sort(), which is what made this hang indefinitely (~275M slots)
+        on a real 1.1 GB 32-bit process scan. See find_pointers_to for the
+        matching numpy.searchsorted lookup side.
+
+        `progress_callback(done_bytes, total_bytes)`, if given, is invoked
+        periodically (throttled) so the UI can show progress -- this pass
+        walks the ENTIRE address space and can take a few seconds.
+
+        Returns a snapshot dict: {"values": numpy array (uint32/uint64) sorted
+        ascending, "addresses": parallel numpy array (slot address for
+        values[i]), "ptr_size": 4 or 8, "min_addr", "max_addr", "count"}, or
+        {"error": "..."} if not attached. The dict shape is unchanged from the
+        pre-numpy version -- only the values/addresses representation moved
+        from Python lists to numpy arrays -- so find_pointer_chains (Stage 2)
+        does not need to change.
+        """
+        if self.engine.pm is None:
+            return {"error": "Not attached — attach to the game first."}
+        if np is None:
+            return {"error": "numpy is not installed; Pointer Chain Finder "
+                             "needs it (pip install numpy) to handle the "
+                             "tens-to-hundreds of millions of pointer-aligned "
+                             "slots a real snapshot collects."}
+        ptr_size = 8 if self.engine._is64 else 4
+        dtype = np.uint64 if ptr_size == 8 else np.uint32
+
+        regions = list(self.engine._iter_committed())
+        if not regions:
+            return {"error": "No committed, readable regions found."}
+        min_addr = min(base for base, _size in regions)
+        max_addr = max(base + size for base, size in regions)
+
+        CHUNK = 0x100000   # 1 MB; divisible by both 4 and 8, so as long as
+                           # each chunk starts pointer-aligned (pages are
+                           # 4 KB-aligned, so this always holds in practice),
+                           # no pointer-aligned slot straddles a chunk edge --
+                           # no read overlap needed, unlike AOB byte scanning.
+        value_chunks = []
+        addr_chunks = []
+        total = sum(size for _base, size in regions)
+        done = 0
+        next_report = 0
+        PROGRESS_STEP = 0x400000   # report at most every ~4 MB
+
+        for base, size in regions:
+            # First absolute address in this region that's pointer-aligned
+            # (region bases are effectively always page-, hence ptr-, aligned
+            # already, but this is correct even if that ever weren't true).
+            first_off = (-base) % ptr_size
+            off = first_off
+            while off < size:
+                rlen = min(CHUNK, size - off)
+                rlen -= rlen % ptr_size    # keep every read slot-aligned
+                if rlen == 0:
+                    break
+                data = self.engine._read(base + off, rlen)
+                if data:
+                    count = len(data) // ptr_size
+                    if count:
+                        arr = np.frombuffer(data, dtype=dtype, count=count)
+                        mask = (arr >= min_addr) & (arr < max_addr)
+                        if mask.any():
+                            addr_all = (np.uint64(base + off)
+                                       + np.arange(count, dtype=np.uint64)
+                                       * np.uint64(ptr_size))
+                            value_chunks.append(arr[mask])
+                            addr_chunks.append(addr_all[mask].astype(dtype))
+                off += rlen
+                done += rlen
+                if progress_callback and done >= next_report:
+                    progress_callback(done, total)
+                    next_report = done + PROGRESS_STEP
+
+        if value_chunks:
+            values = np.concatenate(value_chunks)
+            addresses = np.concatenate(addr_chunks)
+        else:
+            values = np.empty(0, dtype=dtype)
+            addresses = np.empty(0, dtype=dtype)
+
+        order = np.argsort(values, kind="quicksort")
+        values = values[order]
+        addresses = addresses[order]
+
+        return {
+            "values": values,
+            "addresses": addresses,
+            "ptr_size": ptr_size,
+            "min_addr": min_addr,
+            "max_addr": max_addr,
+            "count": int(values.size),
+        }
+
+    def find_pointers_to(self, snapshot, target_address, max_offset=4096,
+                         max_results=10000):
+        """Binary-search `snapshot` for slots that could plausibly point at
+        `target_address` -- i.e. whose value falls in
+        [target_address - max_offset, target_address] (a container object's
+        base address, plus a small positive field offset, landing exactly on
+        the target). Reuses the ONE snapshot -- no memory is touched here.
+        Uses numpy.searchsorted (the vectorized equivalent of bisect) against
+        the snapshot's numpy arrays, matching build_pointer_snapshot's scale.
+
+        Capped at `max_results` hits; if the cap is hit, `capped` is True so
+        the caller can warn that this value is too "common" (e.g. 0 or a
+        small int) to be a useful pointer target, and suggest a smaller
+        max_offset.
+
+        Returns {"hits": [{"address": L, "offset": target_address - value at
+        L}, ...], "capped": bool, "count": total matches before capping} or
+        {"error": "..."} if the snapshot looks invalid.
+        """
+        values = snapshot.get("values")
+        addresses = snapshot.get("addresses")
+        if values is None or addresses is None:
+            return {"error": "Invalid snapshot."}
+        # Clamp instead of letting a negative value hit an unsigned numpy
+        # array (target_address < max_offset is only possible right near
+        # address 0, never a real pointer, but must not raise/wrap).
+        lo_value = max(0, target_address - max_offset)
+        lo_idx = int(np.searchsorted(values, lo_value, side="left"))
+        hi_idx = int(np.searchsorted(values, target_address, side="right"))
+        count = hi_idx - lo_idx
+        capped = count > max_results
+        end = min(hi_idx, lo_idx + max_results)
+        # .tolist() first: numpy unsigned subtraction wraps around on
+        # underflow instead of going negative, so the offset must be computed
+        # in plain Python ints.
+        hits = [
+            {"address": a, "offset": target_address - v}
+            for a, v in zip(addresses[lo_idx:end].tolist(),
+                            values[lo_idx:end].tolist())
+        ]
+        return {"hits": hits, "capped": capped, "count": count}
+
+    def find_pointer_chains(self, snapshot, target_address, max_offset=4096,
+                            max_level=5, max_candidates_per_level=25,
+                            max_total_calls=5000, max_seconds=120,
+                            progress_callback=None):
+        """Recursively resolve a static pointer chain to target_address by
+        repeatedly calling find_pointers_to (Stage 1, UNCHANGED) against the
+        SAME snapshot -- CE's classic algorithm: walk backward from a known
+        runtime address, one dereference at a time, until something lands in
+        a loaded module's static range. No memory is rescanned between
+        levels; only the (cheap) binary search runs again each time.
+
+        At each level, a candidate slot address L either:
+          - falls inside a loaded module's static range (_module_for_address):
+            the chain TERMINATES here. (module_name, L - module_base) is the
+            static anchor.
+          - otherwise: L is itself a dynamic (heap/stack) address, so it
+            becomes the next level's target and gets its own find_pointers_to
+            call, recursing until max_level is hit (that branch is then
+            discarded -- no chain within the allowed depth).
+
+        offset_chain is built in RESOLUTION order (module-adjacent offset
+        first, target-adjacent offset last) so resolve_chain can consume it
+        directly: the first offset is applied to the pointer read from
+        module_base + base_offset, the last offset is added but not
+        dereferenced again -- it IS target_address.
+
+        Candidates are capped at max_candidates_per_level per level
+        (independent of find_pointers_to's own max_results cap). Real heap
+        memory generates far more incidental near-hits per level than small
+        synthetic tests ever did -- with a per-level cap alone, the number of
+        find_pointers_to CALLS still grows multiplicatively across levels
+        (branches-per-level ^ max_level), which can run for a very long time
+        even with a modest per-level cap. So max_total_calls is a hard
+        ceiling on the TOTAL number of find_pointers_to calls made across the
+        whole search (all levels, all branches combined); once hit, the
+        search stops expanding further branches and returns whatever chains
+        were already found, with `capped_total_calls` set on the result so
+        the caller can report "search capped after exploring N branches"
+        rather than the caller mistaking a bounded-but-incomplete search for
+        an exhaustive one. progress_callback(level, calls_made, chains_found),
+        if given, is invoked after every find_pointers_to call so a long
+        search is observable instead of silent.
+
+        If a level's own find_pointers_to call reports `capped` (too many
+        hits -- a "common" value like 0 or a small int), `any_capped` is set
+        on the return so the caller can tell "no chain found" apart from
+        "search was too common to explore exhaustively, try a smaller
+        max_offset" -- candidates ARE still expanded (up to
+        max_candidates_per_level) rather than the branch being silently
+        dropped, since a genuine chain could still be hiding among a common
+        value's hits.
+
+        A slot can coincidentally hold a value within max_offset of its OWN
+        address (self-referential/cyclic data), which would otherwise make
+        the recursion re-discover the same candidates at ever-increasing
+        depth forever (well, until max_level) without ever converging on
+        anything new -- pure noise below the real, shorter chain in the
+        results. `visited` tracks addresses already used as a target ALONG
+        THE CURRENT PATH (not globally -- different branches may legitimately
+        revisit an address a sibling branch also used) and skips recursing
+        into any candidate that would revisit one. This check runs BEFORE
+        the total-call cap is consulted, so cycle detection is never starved
+        out by the cap -- a cyclic candidate never spends a call slot at all.
+
+        max_total_calls alone does not bound wall-clock time: each
+        find_pointers_to call's cost scales with snapshot size (measured at
+        ~2.6s per call on a real ~275M-slot full-process snapshot, vs.
+        microseconds on a small synthetic one), so a fixed call count that is
+        safe on a small process could still take hours on a large one.
+        max_seconds is therefore a wall-clock budget (checked between calls,
+        default 120s) that stops the search independently of how many calls
+        that budget bought -- whichever cap (calls or time) is hit first wins.
+
+        Returns {"chains": [...], "any_capped": bool,
+        "capped_total_calls": bool, "capped_time": bool} where each chain is
+        {"module": name_or_None, "base_offset": int, "offset_chain": [...],
+        "level_count": int}, deduplicated and sorted ascending by
+        level_count (CE convention: fewer levels = more likely stable/
+        intentional). Or {"error": "..."} if the snapshot looks invalid.
+        """
+        if snapshot.get("values") is None:
+            return {"error": "Invalid snapshot."}
+
+        chains = []
+        seen = set()
+        any_capped = [False]
+        calls_made = [0]
+        capped_total_calls = [False]
+        capped_time = [False]
+        start_time = time.time()
+
+        def _stop():
+            return capped_total_calls[0] or capped_time[0]
+
+        def _recurse(addr, offsets_so_far, level, visited):
+            if _stop():
+                return
+            if calls_made[0] >= max_total_calls:
+                capped_total_calls[0] = True
+                return
+            if time.time() - start_time >= max_seconds:
+                capped_time[0] = True
+                return
+            # max_results is capped to max_candidates_per_level here (rather
+            # than find_pointers_to's own default of 10000) since only the
+            # first max_candidates_per_level hits are ever used below -- with
+            # a real high-branching-factor value, building thousands of
+            # unused hit dicts per call was the dominant cost across
+            # max_total_calls calls.
+            res = self.find_pointers_to(snapshot, addr, max_offset=max_offset,
+                                        max_results=max_candidates_per_level)
+            calls_made[0] += 1
+            if progress_callback:
+                progress_callback(level, calls_made[0], len(chains))
+            if "error" in res:
+                return
+            if res["capped"]:
+                any_capped[0] = True
+            for hit in res["hits"][:max_candidates_per_level]:
+                if _stop():
+                    break
+                slot_addr = hit["address"]
+                if slot_addr in visited:
+                    continue   # cyclic/self-referential -- not a new chain
+                offset = hit["offset"]
+                mod_name, mod_base, mod_size = \
+                    self.engine._module_for_address(slot_addr)
+                offset_chain = [offset] + offsets_so_far
+                if mod_size:
+                    key = (mod_name, slot_addr - mod_base, tuple(offset_chain))
+                    if key not in seen:
+                        seen.add(key)
+                        chains.append({
+                            "module": mod_name,
+                            "base_offset": slot_addr - mod_base,
+                            "offset_chain": offset_chain,
+                            "level_count": level + 1,
+                        })
+                elif level + 1 < max_level:
+                    _recurse(slot_addr, offset_chain, level + 1,
+                            visited | {slot_addr})
+                # level + 1 == max_level and not in a module: branch
+                # discarded -- exceeded max_level without a static base.
+
+        _recurse(target_address, [], 0, {target_address})
+        chains.sort(key=lambda c: c["level_count"])
+        return {"chains": chains, "any_capped": any_capped[0],
+                "capped_total_calls": capped_total_calls[0],
+                "capped_time": capped_time[0]}
+
+    def resolve_chain(self, module_name, base_offset, offset_chain):
+        """Re-resolve a stored chain description from scratch against
+        whatever process is CURRENTLY attached -- this is what makes restart
+        verification possible: the exact same (module, base_offset,
+        offset_chain) triple, walked fresh, either survives (still lands on
+        something sensible) or doesn't (the game's memory layout changed).
+
+        Mirrors find_pointer_chains' offset_chain convention: start at
+        module_base + base_offset, then for each offset in order, read a
+        pointer at the current address and add the offset to get the next
+        address -- the LAST addition is not followed by another read, since
+        it IS the final resolved (target) address, not another pointer slot.
+
+        `module_name=None` means the main executable module (matching
+        _module_for_address's convention, so a chain found via
+        find_pointer_chains can be passed straight through unchanged).
+
+        Returns {"address": resolved_address} or {"error": "..."}.
+        """
+        if self.engine.pm is None:
+            return {"error": "Not attached — attach to the game first."}
+        base, size = self.engine._main_module_range(module_name)
+        if not size:
+            return {"error": "Module '{}' not found in the current process."
+                            .format(module_name or "main module")}
+        if not offset_chain:
+            return {"error": "Empty offset chain."}
+        ptr_size = 8 if self.engine._is64 else 4
+        fmt = "<Q" if ptr_size == 8 else "<I"
+
+        addr = base + base_offset
+        for off in offset_chain:
+            raw = self.engine._read(addr, ptr_size)
+            if not raw or len(raw) != ptr_size:
+                return {"error": "Could not read pointer at {:#x}.".format(addr)}
+            ptr = struct.unpack(fmt, raw)[0]
+            addr = ptr + off
+        return {"address": addr}
 
 
 # ---------------------------------------------------------------------------

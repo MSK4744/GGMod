@@ -2,6 +2,8 @@
 pymem
 keyboard
 capstone        # x86/x64 disassembler — auto-calculates hook "steal" length
+numpy           # Pointer Chain Finder — vectorized snapshot sort/search over
+                # tens-to-hundreds of millions of pointer-aligned slots
 
 # Build-time only (bundling the standalone .exe)
 pyinstaller

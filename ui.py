@@ -18,7 +18,7 @@ import sys
 import threading
 
 import engine  # for the capstone-backed steal exceptions (Insufficient/Mid)
-from engine import DebugSession, MemoryScanner
+from engine import DebugSession, MemoryScanner, PointerChainFinder
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 
@@ -69,7 +69,7 @@ SCAN_HOTKEY_LABELS = dict(SCAN_HOTKEY_ACTIONS)
 
 GRIP = "⋮"   # ⋮ three-dot drag handle shown before each mod name
 
-TEMPLATES = ["hard_freeze", "pointer_capture"]
+TEMPLATES = ["hard_freeze", "pointer_capture", "pointer_chain"]
 FREEZE_MODES = ["value", "nop"]
 POLL_MODES = ["never_decrease", "clamp_min", "set_once", "hard_set"]
 REGISTERS = [
@@ -98,6 +98,9 @@ class GGModUI:
         # debugger, so it must never run in the background. self.log is passed
         # so debugger lifecycle events surface in the main log.
         self.debugger = DebugSession(engine, log_callback=self.log)
+        # Static pointer-chain finder (CE-style static pointer scan); read-only,
+        # like the value scanner -- discovers candidates, never writes.
+        self.pointer_finder = PointerChainFinder(engine)
 
         self.config_path = None       # path to the loaded JSON
         self.config_raw = {}          # full parsed config (so we can re-save)
@@ -314,6 +317,8 @@ class GGModUI:
                            self.open_scanner_window).pack(side=tk.LEFT, padx=(16, 4))
         self._button_ghost(bar, "Find Writes",
                            self.open_findwrites_window).pack(side=tk.LEFT, padx=4)
+        self._button_ghost(bar, "Pointer Chains",
+                           self.open_pointerchains_window).pack(side=tk.LEFT, padx=4)
 
         self.status_var = tk.StringVar(value="● Not attached")
         self.status_label = self._label(
@@ -438,9 +443,11 @@ class GGModUI:
         self._build_add_tab()
 
         # Independent tool windows, created lazily on first open (see
-        # open_scanner_window / open_findwrites_window); None while closed.
+        # open_scanner_window / open_findwrites_window / open_pointerchains_
+        # window); None while closed.
         self._scan_win = None
         self._fw_win = None
+        self._chain_win = None
         # Scanner/Find-Writes session state, initialized unconditionally so
         # detach/close/watchlist helpers work even before either tool window
         # has been opened. Rebuilt fresh each time the owning window opens.
@@ -892,12 +899,14 @@ class GGModUI:
         fsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.fw_tree = ttk.Treeview(
             list_frame,
-            columns=("hits", "time", "address", "module", "insn", "send"),
+            columns=("hits", "time", "address", "module", "insn", "send",
+                     "chains"),
             show="headings", height=12, yscrollcommand=fsb.set)
         for key, text, width, minw in (
             ("hits", "Hits", 50, 40), ("time", "Last", 70, 60),
             ("address", "Instruction", 130, 100), ("module", "Module", 120, 70),
             ("insn", "Decoded", 240, 120), ("send", "", 110, 110),
+            ("chains", "", 110, 110),
         ):
             self.fw_tree.heading(key, text=text, anchor="w")
             self.fw_tree.column(key, width=width, minwidth=minw, anchor="w",
@@ -1034,7 +1043,7 @@ class GGModUI:
             self.fw_tree.insert(
                 "", "end", iid=key,
                 values=(hit["count"], hit["time"], hit["address"],
-                        hit["module"], hit["text"], "→ Send"))
+                        hit["module"], hit["text"], "→ Send", "→ Chains"))
         else:
             known["count"] = hit["count"]
             known["time"] = hit["time"]
@@ -1062,18 +1071,23 @@ class GGModUI:
 
     def _on_fw_click(self, event):
         """Clicking the Send cell pushes that specific instruction into Add
-        Mod — important when several different code paths write the same
-        address and the user needs a particular one, not just the first."""
+        Mod, or the Chains cell into Pointer Chains -- important when several
+        different code paths write the same address and the user needs a
+        particular one, not just the first."""
         if self.fw_tree.identify("region", event.x, event.y) != "cell":
             return
         cols = self.fw_tree["columns"]
         col_id = self.fw_tree.identify_column(event.x)
         idx = int(col_id[1:]) - 1 if col_id.startswith("#") else -1
-        if idx < 0 or idx >= len(cols) or cols[idx] != "send":
+        if idx < 0 or idx >= len(cols) or cols[idx] not in ("send", "chains"):
             return
         wid = self.fw_tree.identify_row(event.y)
-        if wid:
+        if not wid:
+            return
+        if cols[idx] == "send":
             self._send_fw_address(wid)
+        else:
+            self._send_fw_address_to_pointerchains(wid)
 
     def _on_fw_double_click(self, event):
         wid = self._fw_selected_address(event)
@@ -1092,6 +1106,14 @@ class GGModUI:
         if self.debugger.is_running():
             self._stop_watch(reason="Stopped — address sent to Add Mod.")
         self._send_address_to_add_mod(hit["address"], auto_read=True)
+
+    def _send_fw_address_to_pointerchains(self, key):
+        """Send one captured instruction's write address into Pointer
+        Chains as the target to search for a static chain to."""
+        hit = self._fw_rows.get(key)
+        if hit is None:
+            return
+        self._send_address_to_pointerchains(hit["address"])
 
     # ---- Watch List: CE-style saved-address panel ------------------------
     def _build_watchlist_panel(self, tab):
@@ -1116,7 +1138,7 @@ class GGModUI:
         self.watch_tree = ttk.Treeview(
             list_frame,
             columns=("active", "desc", "address", "type", "value",
-                     "addmod", "remove"),
+                     "addmod", "chains", "remove"),
             show="headings", height=5, yscrollcommand=wsb.set)
         self.watch_tree.heading("active", text="Active", anchor="w")
         self.watch_tree.column("active", width=55, minwidth=50, anchor="w",
@@ -1131,6 +1153,9 @@ class GGModUI:
         self.watch_tree.column("value", width=90, minwidth=60, anchor="w")
         self.watch_tree.heading("addmod", text="", anchor="center")
         self.watch_tree.column("addmod", width=90, minwidth=90,
+                               anchor="center", stretch=False)
+        self.watch_tree.heading("chains", text="", anchor="center")
+        self.watch_tree.column("chains", width=100, minwidth=100,
                                anchor="center", stretch=False)
         self.watch_tree.heading("remove", text="", anchor="center")
         self.watch_tree.column("remove", width=28, minwidth=28,
@@ -1169,6 +1194,8 @@ class GGModUI:
             self._edit_watch_desc(wid)
         elif col == "addmod":
             self._use_watch_in_add_mod(wid)
+        elif col == "chains":
+            self._use_watch_in_pointerchains(wid)
         elif col == "remove":
             self._remove_watch_row(wid)
 
@@ -1209,7 +1236,7 @@ class GGModUI:
         self.watch_tree.insert(
             "", "end", iid=wid,
             values=("☐", "", addr_str, vtype_label, value_str,
-                    "→ Add Mod", "✕"))
+                    "→ Add Mod", "→ Chains", "✕"))
         self.scan_status.set("Added {} to Watch List.".format(addr_str))
         self._update_scan_auto()   # the watch tick may now need to start
 
@@ -1308,12 +1335,29 @@ class GGModUI:
         self._from_address(self._hook_entries[0], prefill_address=address_str,
                            auto_read=auto_read)
 
+    def _send_address_to_pointerchains(self, address_str):
+        """Shared 'take this address into Pointer Chains' navigation, mirroring
+        _send_address_to_add_mod's pattern for the third tool window: opens
+        (or focuses) the Pointer Chains window and pre-fills its target
+        address field. Pure navigation + pre-fill -- does not start a scan."""
+        self.open_pointerchains_window()
+        self._chain_win.lift()
+        self._chain_win.focus_force()
+        self.chain_target_var.set(address_str)
+
     def _use_watch_in_add_mod(self, wid):
         """'Use in Add Mod' on a Watch List row."""
         row = self._watch_rows.get(wid)
         if row is None:
             return
         self._send_address_to_add_mod(row["address_str"])
+
+    def _use_watch_in_pointerchains(self, wid):
+        """'Use in Pointer Chains' on a Watch List row."""
+        row = self._watch_rows.get(wid)
+        if row is None:
+            return
+        self._send_address_to_pointerchains(row["address_str"])
 
     def _remove_watch_row(self, wid):
         self._watch_rows.pop(wid, None)
@@ -1727,6 +1771,435 @@ class GGModUI:
         self.root.after(
             0, lambda: self._run_scan_async(lambda: self.scanner.next_scan(action)))
 
+    # ==================================================================
+    # Pointer Chains window -- automates CE's static pointer scan (Stage 2:
+    # recursion via engine.find_pointer_chains + restart-verification UI).
+    # Read-only/discovery only, same philosophy as the Value Scanner -- never
+    # writes to the target. A surviving chain gets copied into a mod by the
+    # user; nothing here auto-applies.
+    # ==================================================================
+    def open_pointerchains_window(self):
+        """Open the Pointer Chains tool window, or focus it if already open."""
+        if self._chain_win is not None and self._chain_win.winfo_exists():
+            self._chain_win.deiconify()
+            self._chain_win.lift()
+            self._chain_win.focus_force()
+            return
+        self._build_pointerchains_window()
+
+    def _close_pointerchains_window(self):
+        """Tear down the window and drop its session state -- same
+        "cleared on close" convention as Value Scanner/Find Writes. The
+        snapshot is a large in-memory numpy structure; no reason to keep it
+        once the window is gone."""
+        self._chain_snapshot = None
+        self._chain_rows = {}
+        win = self._chain_win
+        self._chain_win = None
+        if win is not None:
+            win.destroy()
+
+    def _build_pointerchains_window(self):
+        top = self._dialog("Pointer Chains", minsize=(760, 520), modal=False)
+        self._chain_win = top
+        top.protocol("WM_DELETE_WINDOW", self._close_pointerchains_window)
+
+        self._chain_snapshot = None
+        self._chain_rows = {}   # iid -> chain dict (module/base_offset/
+                                # offset_chain/level_count) + "marked" bool
+
+        header = tk.Frame(top, bg=BG)
+        header.pack(fill=tk.X, padx=8, pady=(8, 2))
+        self._label(header, "Pointer Chain Finder", fg=ACCENT,
+                    font=(FONT, 11, "bold")).pack(side=tk.LEFT)
+
+        intro = self._label(
+            top, "Automates Cheat Engine's static pointer scan: finds a "
+            "module_base + fixed-offset chain that resolves to a target "
+            "address without needing a live pointer_capture hook to fire "
+            "first. Read-only -- copy a surviving chain into a mod by hand.",
+            fg=MUTED, font=(FONT, 8), wraplength=700, justify="left")
+        intro.pack(fill=tk.X, padx=8, pady=(0, 4))
+        top.bind("<Configure>", lambda e: intro.config(
+            wraplength=max(200, e.width - 16)))
+
+        # ---- Target address + Scan ----
+        scan_row = tk.Frame(top, bg=BG)
+        scan_row.pack(fill=tk.X, padx=8, pady=(0, 4))
+        scan_row.columnconfigure(1, weight=1)
+        self._label(scan_row, "Target address:", fg=MUTED, width=14,
+                    anchor="w").grid(row=0, column=0, sticky="w")
+        self.chain_target_var = tk.StringVar()
+        self._entry(scan_row, self.chain_target_var, width=18).grid(
+            row=0, column=1, sticky="ew", padx=(0, 6))
+        self.chain_scan_btn = self._button(scan_row, "Scan", self.on_chain_scan)
+        self.chain_scan_btn.grid(row=0, column=2, sticky="e")
+
+        opts = tk.Frame(top, bg=BG)
+        opts.pack(fill=tk.X, padx=8, pady=(0, 4))
+        self._label(opts, "Max offset:", fg=MUTED).pack(side=tk.LEFT)
+        self.chain_max_offset = tk.StringVar(value="4096")
+        self._entry(opts, self.chain_max_offset, width=8).pack(
+            side=tk.LEFT, padx=(4, 12))
+        self._label(opts, "Max level:", fg=MUTED).pack(side=tk.LEFT)
+        self.chain_max_level = tk.StringVar(value="5")
+        self._entry(opts, self.chain_max_level, width=4).pack(
+            side=tk.LEFT, padx=(4, 0))
+        # Level 4-5 chains route through several dynamic (heap/stack) hops
+        # before ever reaching a static base -- each hop is a fresh chance
+        # for the value to move across a restart, so they're far less likely
+        # to survive one than a 1-2 level chain. Default to hiding them so
+        # the table isn't dominated by results that are unlikely to be
+        # useful; the checkbox reveals them on demand without re-scanning.
+        self.chain_show_deep_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            opts, text="Show level 3-5 chains", variable=self.chain_show_deep_var,
+            command=self._refresh_chain_tree, bg=BG, fg=MUTED, selectcolor=BG3,
+            activebackground=BG, activeforeground=MUTED, font=(FONT, 8)
+        ).pack(side=tk.LEFT, padx=(16, 0))
+
+        # ---- Progress (packed only while a scan is running) ----
+        self.chain_progress_var = tk.DoubleVar(value=0)
+        self.chain_progress = ttk.Progressbar(
+            top, orient="horizontal", mode="determinate", maximum=100,
+            variable=self.chain_progress_var, style="GG.Horizontal.TProgressbar")
+
+        self.chain_status = tk.StringVar(value="Not scanned yet.")
+        self._chain_status_label = self._label(
+            top, "", fg=MUTED, textvariable=self.chain_status,
+            wraplength=700, justify="left")
+        self._chain_status_label.pack(anchor="w", padx=8, pady=(2, 4))
+        top.bind("<Configure>", lambda e: self._chain_status_label.config(
+            wraplength=max(200, e.width - 16)), add="+")
+
+        # ---- Results table ----
+        list_frame = tk.Frame(top, bg=BG)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
+        sb = tk.Scrollbar(list_frame)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.chain_tree = ttk.Treeview(
+            list_frame,
+            columns=("mark", "module", "base_offset", "offset_chain",
+                     "levels", "status"),
+            show="headings", height=12, yscrollcommand=sb.set)
+        for key, text, width, anchor, stretch in (
+            ("mark", "Mark", 50, "center", False),
+            ("module", "Module", 140, "w", False),
+            ("base_offset", "Base Offset", 100, "w", False),
+            ("offset_chain", "Offset Chain", 220, "w", True),
+            ("levels", "Levels", 55, "center", False),
+            ("status", "Status", 200, "w", True),
+        ):
+            self.chain_tree.heading(key, text=text, anchor=anchor)
+            self.chain_tree.column(key, width=width, anchor=anchor,
+                                   stretch=stretch)
+        self.chain_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.config(command=self.chain_tree.yview)
+        self.chain_tree.bind("<Button-1>", self._on_chain_tree_click)
+        self.chain_tree.bind("<Double-1>", self._on_chain_tree_double_click)
+        self.chain_tree.tag_configure("survived", foreground=GREEN)
+        self.chain_tree.tag_configure("failed", foreground=RED)
+        self.chain_tree.tag_configure("unknown", foreground=AMBER)
+
+        # ---- Use a chain as a new mod ----
+        use_row = tk.Frame(top, bg=BG)
+        use_row.pack(fill=tk.X, padx=8, pady=(0, 4))
+        self._button(use_row, "Use for New Mod",
+                     self.on_chain_use_for_new_mod).pack(side=tk.LEFT)
+        self._label(
+            use_row, "Select a row above, then click here (or double-click "
+            "the row) to pre-fill a pointer_chain mod in Add Mod.",
+            fg=MUTED, font=(FONT, 8)).pack(side=tk.LEFT, padx=(8, 0))
+
+        # ---- Re-resolve after restart ----
+        verify_row = tk.Frame(top, bg=BG)
+        verify_row.pack(fill=tk.X, padx=8, pady=(0, 8))
+        verify_row.columnconfigure(1, weight=1)
+        self._label(verify_row, "Expected address (optional):", fg=MUTED,
+                    anchor="w").grid(row=0, column=0, sticky="w")
+        self.chain_expected_var = tk.StringVar()
+        self._entry(verify_row, self.chain_expected_var, width=18).grid(
+            row=0, column=1, sticky="w", padx=(6, 6))
+        self._button(verify_row, "Re-resolve after restart",
+                     self.on_chain_reresolve).grid(row=0, column=2, sticky="e")
+        self._label(
+            verify_row, "Mark chains (checkbox) to verify, then re-resolve "
+            "after restarting the game -- compare against a known-good "
+            "address, or leave it blank to just eyeball the resolved "
+            "address.", fg=MUTED, font=(FONT, 8), wraplength=700,
+            justify="left").grid(row=1, column=0, columnspan=3, sticky="w",
+                                 pady=(4, 0))
+
+    # ---- Pointer Chains: scan --------------------------------------------
+    def on_chain_scan(self):
+        if not self.engine.is_attached():
+            self.chain_status.set("Attach to a game first.")
+            return
+        raw = self.chain_target_var.get().strip()
+        try:
+            target_address = int(raw, 16)
+        except ValueError:
+            self.chain_status.set(
+                "Enter a valid hex target address (e.g. 16EDAFC8).")
+            return
+        try:
+            max_offset = int(self.chain_max_offset.get().strip() or "4096", 0)
+        except ValueError:
+            max_offset = 4096
+        try:
+            max_level = int(self.chain_max_level.get().strip() or "5", 0)
+        except ValueError:
+            max_level = 5
+
+        self.chain_tree.delete(*self.chain_tree.get_children())
+        self._chain_rows = {}
+        self.chain_scan_btn.config(state=tk.DISABLED)
+        self.chain_progress_var.set(0)
+        if not self.chain_progress.winfo_manager():
+            self.chain_progress.pack(fill=tk.X, padx=8, pady=(0, 2),
+                                     before=self._chain_status_label)
+        self.chain_status.set(
+            "Building pointer snapshot (walks ALL committed memory -- can "
+            "take a minute or more on a large process)...")
+
+        def _progress(done, total):
+            pct = (done / total * 100.0) if total else 0
+            self.root.after(0, lambda: self._chain_progress_update(pct, done, total))
+
+        def _chain_progress(level, calls_made, chains_found):
+            if calls_made % 25 != 0:
+                return   # throttle -- this can fire thousands of times
+            self.root.after(0, lambda: self.chain_status.set(
+                "Searching for chains... level {}, {} branch(es) explored, "
+                "{} chain(s) found so far.".format(level, calls_made,
+                                                   chains_found)))
+
+        def _worker():
+            snap = self.pointer_finder.build_pointer_snapshot(
+                progress_callback=_progress)
+            if "error" in snap:
+                self.root.after(0, lambda: self._chain_scan_failed(snap["error"]))
+                return
+            res = self.pointer_finder.find_pointer_chains(
+                snap, target_address, max_offset=max_offset,
+                max_level=max_level, progress_callback=_chain_progress)
+            self.root.after(0, lambda: self._chain_scan_done(snap, res, max_level))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _chain_progress_update(self, pct, done, total):
+        self.chain_progress_var.set(pct)
+        self.chain_status.set(
+            "Building pointer snapshot... {:.0f}% ({}/{} bytes)".format(
+                pct, done, total))
+
+    def _chain_scan_failed(self, message):
+        self.chain_progress.pack_forget()
+        self.chain_scan_btn.config(state=tk.NORMAL)
+        self.chain_status.set(message)
+
+    def _chain_scan_done(self, snapshot, res, max_level):
+        self._chain_snapshot = snapshot
+        self.chain_progress_var.set(100)
+        self.chain_progress.pack_forget()
+        self.chain_scan_btn.config(state=tk.NORMAL)
+        if "error" in res:
+            self.chain_status.set(res["error"])
+            return
+
+        chains = res["chains"]
+        self._chain_order = []
+        for i, chain in enumerate(chains):
+            iid = "c{}".format(i)
+            self._chain_order.append(iid)
+            self._chain_rows[iid] = dict(chain, marked=False, status_text="",
+                                         status_tag=None)
+        self._refresh_chain_tree()
+
+        # Plain-language status: distinguish "nothing within max_level" from
+        # "capped -- value too common" (the two failure modes read very
+        # differently to the user: one says "give up on a short chain", the
+        # other says "try a smaller max offset").
+        if chains:
+            msg = "{} chain(s) found ({} snapshot slot(s)).".format(
+                len(chains), snapshot.get("count", 0))
+            if res.get("any_capped"):
+                msg += (" Note: at least one branch was capped (a common "
+                       "value) -- there may be more chains a smaller max "
+                       "offset would reveal.")
+            if res.get("capped_total_calls") or res.get("capped_time"):
+                msg += (" Search stopped early ({}) -- there may be more "
+                       "chains a smaller max offset or lower max level "
+                       "would reveal faster.".format(
+                           "time budget reached" if res.get("capped_time")
+                           else "max branches explored"))
+        elif res.get("capped_total_calls") or res.get("capped_time"):
+            msg = ("Search capped ({}) without finding a static chain -- "
+                  "the search space is too wide (likely a common value "
+                  "with lots of incidental hits). Try a smaller max offset "
+                  "or a lower max level.".format(
+                      "time budget reached" if res.get("capped_time")
+                      else "max branches explored"))
+        elif res.get("any_capped"):
+            msg = ("Scan capped -- a value along the search path is too "
+                  "common (e.g. 0 or a small int) to search exhaustively. "
+                  "Try a smaller max offset.")
+        else:
+            msg = ("No static chain found within {} level(s) -- this "
+                  "address may only be reachable through a live "
+                  "pointer_capture hook, not a short static chain.").format(
+                max_level)
+        self.chain_status.set(msg)
+
+    def _refresh_chain_tree(self):
+        """Repopulate the tree from self._chain_rows, applying the "Show
+        level 3-5 chains" filter. Marked/status state lives on the row dict
+        (not just the tree widget) so toggling the filter never loses a
+        mark or a re-resolve result on a chain that's temporarily hidden --
+        it just re-renders. A 4-5 level chain crosses several dynamic
+        (heap/stack) hops before reaching a static base, and each hop is
+        another chance for the value to move across a restart, so they're
+        hidden by default to keep the table focused on the chains most
+        likely to actually survive one."""
+        if not hasattr(self, "_chain_order"):
+            return
+        self.chain_tree.delete(*self.chain_tree.get_children())
+        show_deep = self.chain_show_deep_var.get()
+        for iid in self._chain_order:
+            entry = self._chain_rows.get(iid)
+            if entry is None:
+                continue
+            if not show_deep and entry["level_count"] >= 3:
+                continue
+            mod_label = entry["module"] or "main module"
+            offs = ", ".join("0x{:X}".format(o) for o in entry["offset_chain"])
+            tags = (entry["status_tag"],) if entry["status_tag"] else ()
+            self.chain_tree.insert(
+                "", "end", iid=iid, tags=tags,
+                values=("☑" if entry["marked"] else "☐", mod_label,
+                        "0x{:X}".format(entry["base_offset"]), offs,
+                        entry["level_count"], entry["status_text"]))
+
+    # ---- Pointer Chains: mark for verification -----------------------------
+    def _on_chain_tree_click(self, event):
+        if self.chain_tree.identify("region", event.x, event.y) != "cell":
+            return
+        col_id = self.chain_tree.identify_column(event.x)
+        row = self.chain_tree.identify_row(event.y)
+        if not row or col_id != "#1":   # "mark" is the first column
+            return
+        entry = self._chain_rows.get(row)
+        if entry is None:
+            return
+        entry["marked"] = not entry["marked"]
+        self.chain_tree.set(row, "mark", "☑" if entry["marked"] else "☐")
+
+    # ---- Pointer Chains: send a chain to Add Mod --------------------------
+    def _on_chain_tree_double_click(self, event):
+        """Double-clicking a chain row is a shortcut for "Use for New Mod" --
+        skips the mark-column toggle since double-click always lands on
+        whichever cell the pointer is over, not necessarily the mark column."""
+        row = self.chain_tree.identify_row(event.y)
+        if row:
+            self.chain_tree.selection_set(row)
+            self.on_chain_use_for_new_mod()
+
+    def on_chain_use_for_new_mod(self):
+        """Send the selected chain's (module, base_offset, offset_chain) into
+        a fresh pointer_chain mod in the Add Mod tab -- mirrors
+        _send_address_to_add_mod's navigation pattern for the other tools.
+        Only fills the chain-identifying fields; name and write-behavior
+        (poll_mode/value) are left for the user to fill in, same as
+        pointer_capture's "From address..." leaves the register editable."""
+        sel = self.chain_tree.selection()
+        if not sel:
+            self.chain_status.set(
+                "Select a chain row first (click it), then Use for New Mod.")
+            return
+        entry = self._chain_rows.get(sel[0])
+        if entry is None:
+            return
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+        self.notebook.select(1)   # Add Mod tab
+        self.form_vars["template"].set("pointer_chain")
+        self._refresh_form_fields()
+        self.form_vars["module"].set(entry["module"] or "")
+        self.form_vars["base_offset"].set("{:X}".format(entry["base_offset"]))
+        self.form_vars["offset_chain"].set(
+            ", ".join("{:X}".format(o) for o in entry["offset_chain"]))
+        self.log(
+            "Pointer Chains: sent chain to Add Mod (module={}, "
+            "base_offset=0x{:X}, offset_chain=[{}]) -- set a name and "
+            "write-behavior fields, then Save Mod.".format(
+                entry["module"] or "main module", entry["base_offset"],
+                ", ".join("0x{:X}".format(o) for o in entry["offset_chain"])))
+
+    # ---- Pointer Chains: restart verification ------------------------------
+    def on_chain_reresolve(self):
+        """Re-resolve every marked chain from scratch against whatever
+        process is CURRENTLY attached (meant to be run after restarting the
+        game) and compare against an optional expected address. Read-only:
+        resolve_chain only reads memory, never writes."""
+        if not self.engine.is_attached():
+            self.chain_status.set(
+                "Attach to the (possibly restarted) game first.")
+            return
+        marked = [(iid, entry) for iid, entry in self._chain_rows.items()
+                 if entry.get("marked")]
+        if not marked:
+            self.chain_status.set(
+                "Mark at least one chain (checkbox in the Mark column) to "
+                "re-resolve.")
+            return
+
+        expected_raw = self.chain_expected_var.get().strip()
+        expected = None
+        if expected_raw:
+            try:
+                expected = int(expected_raw, 16)
+            except ValueError:
+                self.chain_status.set(
+                    "Expected address must be valid hex, or leave it blank.")
+                return
+
+        survived = failed = 0
+        for iid, entry in marked:
+            res = self.pointer_finder.resolve_chain(
+                entry["module"], entry["base_offset"], entry["offset_chain"])
+            if "error" in res:
+                entry["status_text"] = res["error"]
+                entry["status_tag"] = "failed"
+                failed += 1
+            else:
+                addr = res["address"]
+                if expected is None:
+                    entry["status_text"] = "0x{:X} (no expected value given)".format(addr)
+                    entry["status_tag"] = "unknown"
+                elif addr == expected:
+                    entry["status_text"] = "Survived: 0x{:X}".format(addr)
+                    entry["status_tag"] = "survived"
+                    survived += 1
+                else:
+                    entry["status_text"] = "Failed: 0x{:X} (expected 0x{:X})".format(
+                        addr, expected)
+                    entry["status_tag"] = "failed"
+                    failed += 1
+            if self.chain_tree.exists(iid):
+                self.chain_tree.set(iid, "status", entry["status_text"])
+                self.chain_tree.item(iid, tags=(entry["status_tag"],))
+
+        if expected is None:
+            self.chain_status.set(
+                "Re-resolved {} marked chain(s) -- compare the resolved "
+                "address(es) manually (no expected value given).".format(
+                    len(marked)))
+        else:
+            self.chain_status.set(
+                "Re-resolved {} marked chain(s): {} survived, {} failed."
+                .format(len(marked), survived, failed))
+
     # ---- Details / Preview tab --------------------------------------
     def _build_details_tab(self):
         tab = tk.Frame(self.notebook, bg=BG)
@@ -1886,6 +2359,35 @@ class GGModUI:
         self.form_vars["struct_offset"] = tk.StringVar()
         self._add_form_row("struct_offset", "Struct offset (hex)",
                            entry(self.form_vars["struct_offset"]))
+
+        # pointer_chain: module_base + base_offset, then walk offset_chain via
+        # live reads. No hooks/cave at all -- resolves straight to the target
+        # address every poll tick. Same write-behavior fields (poll_mode,
+        # value) as pointer_capture, shared below.
+        self.form_vars["module"] = tk.StringVar()
+        self._add_form_row("module", "Module (blank = main exe)",
+                           entry(self.form_vars["module"], width=24))
+
+        self.form_vars["base_offset"] = tk.StringVar()
+        self._add_form_row("base_offset", "Base offset (hex)",
+                           entry(self.form_vars["base_offset"]))
+
+        self.form_vars["offset_chain"] = tk.StringVar()
+        self._add_form_row(
+            "offset_chain", "Offset chain (hex, comma-separated)",
+            entry(self.form_vars["offset_chain"], width=30))
+        chain_tools = tk.Frame(self.form, bg=BG)
+        chain_tools.grid(row=self._row_index, column=0, sticky="w", pady=(0, 2))
+        self._label(chain_tools, "", width=20, anchor="w").pack(side=tk.LEFT)
+        self._button(
+            chain_tools, "Open Pointer Chains…",
+            self.open_pointerchains_window,
+            font=(FONT, 8, "bold")).pack(side=tk.LEFT)
+        self._label(
+            chain_tools, "find a chain there, then \"Use for New Mod\".",
+            fg=MUTED, font=(FONT, 8)).pack(side=tk.LEFT, padx=(6, 0))
+        self.form_rows["chain_tools"] = chain_tools
+        self._row_index += 1
 
         self.form_vars["poll_mode"] = tk.StringVar(value=POLL_MODES[0])
         self._add_form_row("poll_mode", "Poll mode",
@@ -2447,8 +2949,9 @@ class GGModUI:
 
         hard = template == "hard_freeze"
         ptr = template == "pointer_capture"
+        chain = template == "pointer_chain"
 
-        visible = {"name", "template", "notes"}  # notes: optional, both templates
+        visible = {"name", "template", "notes"}  # notes: optional, all templates
         if hard:
             visible |= {"aob", "aob_tools", "offset", "freeze_mode"}  # single flat AOB
             if freeze_mode == "value":
@@ -2460,6 +2963,19 @@ class GGModUI:
             # flat 'aob' row.
             visible |= {"capture_at_attach", "capture_once", "struct_offset",
                         "poll_mode"}
+            if poll_mode in ("clamp_min", "hard_set"):
+                visible.add("value")
+        if chain:
+            # No hooks/cave -- module_base + base_offset, walked via
+            # offset_chain (every entry a real dereferenced hop). struct_offset
+            # is shared with pointer_capture's row: an OPTIONAL flat field
+            # displacement added on top of the chain's result with no further
+            # dereference -- for when offset_chain reaches an object's base
+            # and the actual field to poll sits at a fixed byte offset inside
+            # it (do NOT fold that into offset_chain as an extra hop, or the
+            # resolver will try to dereference the object's own data).
+            visible |= {"module", "base_offset", "offset_chain", "chain_tools",
+                        "struct_offset", "poll_mode"}
             if poll_mode in ("clamp_min", "hard_set"):
                 visible.add("value")
 
@@ -3057,7 +3573,8 @@ class GGModUI:
     def _prefill_form(self, mod):
         """Fill the Add Mod form widgets from an existing mod's values."""
         # Clear scalar fields first.
-        for k in ("name", "aob", "offset", "nop_len", "struct_offset", "value"):
+        for k in ("name", "aob", "offset", "nop_len", "struct_offset", "value",
+                 "module", "base_offset", "offset_chain"):
             self.form_vars[k].set("")
         self.form_vars["template"].set(mod.get("template", TEMPLATES[0]))
         self.form_vars["freeze_mode"].set(mod.get("freeze_mode", FREEZE_MODES[0]))
@@ -3073,6 +3590,15 @@ class GGModUI:
             if mod.get("freeze_mode") == "nop":
                 self.form_vars["nop_len"].set(str(mod.get("nop_len", "")))
             else:
+                self.form_vars["value"].set(str(mod.get("value", "")))
+        elif mod.get("template") == "pointer_chain":
+            self.form_vars["module"].set(mod.get("module", "") or "")
+            self.form_vars["base_offset"].set(str(mod.get("base_offset", "")))
+            self.form_vars["offset_chain"].set(
+                ", ".join(str(o) for o in mod.get("offset_chain") or []))
+            if mod.get("struct_offset"):
+                self.form_vars["struct_offset"].set(str(mod.get("struct_offset")))
+            if mod.get("poll_mode") in ("clamp_min", "hard_set"):
                 self.form_vars["value"].set(str(mod.get("value", "")))
         else:  # pointer_capture
             self.form_vars["struct_offset"].set(str(mod.get("struct_offset", "")))
@@ -3145,7 +3671,7 @@ class GGModUI:
         the Force Set control for ANY active pointer_capture mod."""
         is_active_pc = (
             mod is not None
-            and mod.get("template") == "pointer_capture"
+            and mod.get("template") in ("pointer_capture", "pointer_chain")
             and self.engine.is_mod_active(mod.get("name"))
         )
         # Live value editor: hard_set / clamp_min only (unchanged).
@@ -3505,6 +4031,10 @@ class GGModUI:
                 put("   cave   : {}".format(hr.get("cave_preview")))
                 for w in (hr.get("warnings") or []):
                     put("   warn   : {}".format(w), "warn")
+        elif result.get("resolved_address") is not None or mod.get("template") == "pointer_chain":
+            # pointer_chain: no AOB, no cave -- just the resolved address.
+            put("resolves to  : {}".format(result.get("resolved_address")),
+                "ok" if ready else "err")
         else:
             # hard_freeze: single result.
             put_matches(result.get("match_addresses") or [], result.get("matches"),
@@ -3688,6 +4218,43 @@ class GGModUI:
                         errors.append("Value is required for {}.".format(v["poll_mode"]))
                     else:
                         mod["value"] = int(v["value"], 0)
+
+            elif template == "pointer_chain":
+                if not v["base_offset"].strip():
+                    errors.append("Base offset is required.")
+                else:
+                    int(v["base_offset"], 16)  # validate; stored as the hex string
+                    mod["base_offset"] = v["base_offset"].strip()
+                chain_tokens = [t.strip() for t in
+                               re.split(r"[,\s]+", v["offset_chain"].strip()) if t.strip()]
+                if not chain_tokens:
+                    errors.append("Offset chain is required (e.g. \"58\" or \"58, 10\").")
+                else:
+                    for t in chain_tokens:
+                        int(t, 16)  # validate each hop; stored as hex strings
+                    mod["offset_chain"] = chain_tokens
+                # Only persist 'module' when set, so configs without a module
+                # target stay byte-for-byte the same (main exe), matching
+                # pointer_capture's per-hook module convention.
+                module = v["module"].strip()
+                if module:
+                    mod["module"] = module
+                # struct_offset is OPTIONAL here (unlike pointer_capture, where
+                # it's required) -- blank means offset_chain alone already
+                # reaches the target. When given, it's a FLAT displacement
+                # added on top of offset_chain's resolved pointer, with no
+                # further dereference (see apply_pointer_chain's docstring) --
+                # do not fold a struct-field offset into offset_chain itself.
+                struct_offset = v["struct_offset"].strip()
+                if struct_offset:
+                    int(struct_offset, 16)  # validate
+                    mod["struct_offset"] = struct_offset
+                mod["poll_mode"] = v["poll_mode"]
+                if v["poll_mode"] in ("clamp_min", "hard_set"):
+                    if not v["value"].strip():
+                        errors.append("Value is required for {}.".format(v["poll_mode"]))
+                    else:
+                        mod["value"] = int(v["value"], 0)
         except ValueError:
             errors.append("Numeric fields must be integers (decimal or 0x hex).")
 
@@ -3736,6 +4303,9 @@ class GGModUI:
         # Reset the form for the next entry.
         self.form_vars["name"].set("")
         self.form_vars["aob"].set("")
+        self.form_vars["module"].set("")
+        self.form_vars["base_offset"].set("")
+        self.form_vars["offset_chain"].set("")
         if self.notes_text_widget is not None:
             self.notes_text_widget.delete("1.0", tk.END)
         self._clear_hook_rows()
