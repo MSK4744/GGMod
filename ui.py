@@ -1811,41 +1811,40 @@ class GGModUI:
         self.form_vars["aob"] = tk.StringVar()
         self._add_form_row("aob", "AOB", entry(self.form_vars["aob"], width=30))
 
-        # hard_freeze's AOB gets the same AOB-building tools already wired
-        # into pointer_capture's hook rows -- "From address...", "Paste
-        # line...", and "Auto" steal -- reusing the exact same dialogs/logic
-        # (build_candidate_from_address, parse_disasm_line, compute_min_steal)
-        # rather than duplicating it. hard_freeze has no register/module/
-        # struct_offset concept, so those are throwaway advisory-only vars
-        # here; only "aob" (shared with the form) and "hook_offset" (aliased
-        # to hard_freeze's real "Offset" field -- the byte position within
-        # the AOB match, the same kind of instruction-aligned quantity Auto
-        # computes for pointer_capture's steal length) are real, persisted
-        # fields. offset_var=None on the dialogs below means "don't fill any
-        # offset field from struct_offset" -- that's a different quantity
-        # (a struct-member displacement) that doesn't apply to hard_freeze.
+        # hard_freeze's AOB gets its own AOB-building tools. "From address..."
+        # now calls build_hard_freeze_candidate_from_address (the real,
+        # verified fix -- see its docstring in engine.py): it fills AOB,
+        # Offset, AND NOP length together by locating the target instruction
+        # and walking backward for uniqueness. "Auto" is intentionally
+        # blocked here: compute_min_steal (pointer_capture's steal-length
+        # calculator) answers "how many bytes for a jmp hook," which has no
+        # relationship to hard_freeze's Offset field and was confirmed to
+        # produce wrong values against a real hand-built mod (POP_test.json's
+        # "Infinite Rewind": correct offset=11, but compute_min_steal gave 7
+        # or 17). hard_freeze has no register/module/struct_offset concept,
+        # so "Paste line..." still can't usefully fill anything for it beyond
+        # the AOB itself (offset_var=None, same no-op as before).
         self.form_vars["offset"] = tk.StringVar()
         self._hf_aob_entry = {
             "aob": self.form_vars["aob"],
-            "register": tk.StringVar(value="esi"),
-            "module": tk.StringVar(value=""),
-            "jmp_type": tk.StringVar(value="rel32"),
-            "suggest": tk.StringVar(value=""),
-            "hook_offset": self.form_vars["offset"],
+            # Throwaway: _paste_line always sets entry["register"] (it's used
+            # by pointer_capture's hook rows), but hard_freeze has no register
+            # concept and never reads this var back.
+            "register": tk.StringVar(value=""),
         }
         aob_tools = tk.Frame(self.form, bg=BG)
         aob_tools.grid(row=self._row_index, column=0, sticky="w", pady=(0, 2))
         self._label(aob_tools, "", width=20, anchor="w").pack(side=tk.LEFT)
         self._button(
             aob_tools, "From address…",
-            lambda: self._from_address(self._hf_aob_entry, offset_var=None),
+            lambda: self._from_address_hard_freeze(self._hf_aob_entry),
             font=(FONT, 8, "bold")).pack(side=tk.LEFT, padx=(0, 4))
         self._button(
             aob_tools, "Paste line…",
             lambda: self._paste_line(self._hf_aob_entry, offset_var=None),
             font=(FONT, 8, "bold")).pack(side=tk.LEFT, padx=(0, 4))
         self._button(
-            aob_tools, "Auto", lambda: self._auto_steal(self._hf_aob_entry),
+            aob_tools, "Auto", self._hf_auto_blocked,
             font=(FONT, 8, "bold")).pack(side=tk.LEFT)
         self.form_rows["aob_tools"] = aob_tools
         self._row_index += 1
@@ -2231,6 +2230,127 @@ class GGModUI:
         # fill_btn, which only exists once the lines above have executed).
         if auto_read and prefill_address:
             top.after(0, _read)
+
+    def _from_address_hard_freeze(self, entry, prefill_address=None, auto_read=False):
+        """Dialog: read a live address and auto-fill hard_freeze's AOB/Offset/
+        NOP length -- the real automated fix for hard_freeze (see
+        engine.build_hard_freeze_candidate_from_address's docstring for why
+        this needed its own function rather than reusing compute_min_steal,
+        which answers a different question -- jmp-hook steal size, not "where
+        is the instruction I want to freeze/NOP").
+
+        Deliberately separate from _from_address (pointer_capture's dialog,
+        left untouched) rather than branching inside it, since the two
+        engine calls return differently-shaped results (offset/nop_len here
+        vs capture_register/struct_offset there) and this is purely additive.
+        Same interaction pattern as _from_address: Read shows the decoded
+        AOB/offset/instructions, Fill fields applies them to the form.
+        """
+        self.form_error_var.set("")
+        if not self.engine.is_attached():
+            self.form_error_var.set(
+                "Attach to the game first — 'From address' reads live memory.")
+            return
+
+        top = self._dialog("Build hard_freeze target from address",
+                           minsize=(520, 380))
+
+        head = tk.Frame(top, bg=BG)
+        head.pack(fill=tk.X, padx=12, pady=(12, 4))
+        head.columnconfigure(1, weight=1)
+        self._label(head, "Address (hex, from Cheat Engine):", fg=MUTED).grid(
+            row=0, column=0, sticky="w")
+        addr_var = tk.StringVar(value=prefill_address or "")
+        addr_entry = self._entry(head, addr_var, width=18)
+        addr_entry.grid(row=0, column=1, sticky="ew", padx=6)
+        addr_entry.focus_set()
+        if prefill_address:
+            addr_entry.select_range(0, tk.END)   # pre-filled + selected, ready to Read
+        read_btn = self._button(head, "Read", lambda: _read())
+        read_btn.grid(row=0, column=2, sticky="e")
+
+        result_txt = tk.Text(top, width=64, height=12, bg=BG3, fg=FG, relief=tk.FLAT,
+                             wrap=tk.NONE, font=(MONO, 9), state=tk.DISABLED)
+        result_txt.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
+        result_txt.tag_configure("ok", foreground=GREEN)
+        result_txt.tag_configure("warn", foreground=AMBER)
+        result_txt.tag_configure("err", foreground=RED)
+
+        state = {"candidate": None}
+
+        def _put(text="", tag=None):
+            result_txt.config(state=tk.NORMAL)
+            result_txt.insert(tk.END, text + "\n", (tag,) if tag else ())
+            result_txt.config(state=tk.DISABLED)
+
+        def _read():
+            result_txt.config(state=tk.NORMAL); result_txt.delete("1.0", tk.END)
+            result_txt.config(state=tk.DISABLED)
+            state["candidate"] = None
+            fill_btn.config(state=tk.DISABLED)
+            raw = addr_var.get().strip()
+            try:
+                address = int(raw, 16)   # CE addresses are hex (0x optional)
+            except ValueError:
+                _put("Enter a valid hex address (e.g. 16BBAE38).", "err")
+                return
+            try:
+                res = self.engine.build_hard_freeze_candidate_from_address(address)
+            except engine.HardFreezeUniquenessError as ex:
+                _put(str(ex), "err")
+                return
+            if "error" in res:
+                _put(res["error"], "err")
+                return
+            _put("AOB     : {}".format(res["aob"]))
+            _put("matches : {}".format(res["matches"]), "ok")  # always 1 or it raised
+            _put("module  : {}".format(res.get("module") or "main module"))
+            _put("offset  : {}   nop_len: {}".format(
+                res["offset"], res["nop_len"]), "ok")
+            _put("")
+            _put("decoded instructions (context, ending with the target):")
+            for ins in res.get("instructions", []):
+                _put("  {}  {:<22} {}".format(
+                    ins["address"], ins["bytes"], ins["text"]))
+            state["candidate"] = res
+            fill_btn.config(state=tk.NORMAL)
+
+        def _fill():
+            res = state["candidate"]
+            if not res:
+                return
+            entry["aob"].set(res["aob"])
+            self.form_vars["offset"].set(str(res["offset"]))
+            self.form_vars["nop_len"].set(str(res["nop_len"]))
+            self.log(
+                "From address (hard_freeze): filled AOB (1 match), offset={}, "
+                "nop_len={}.".format(res["offset"], res["nop_len"]))
+            top.destroy()
+
+        btns = tk.Frame(top, bg=BG)
+        btns.pack(fill=tk.X, padx=12, pady=(0, 12))
+        addr_entry.bind("<Return>", lambda _e: _read())
+        fill_btn = self._button(btns, "Fill fields", _fill)
+        fill_btn.pack(side=tk.LEFT)
+        fill_btn.config(state=tk.DISABLED)
+        self._button_ghost(btns, "Cancel", top.destroy).pack(side=tk.LEFT, padx=(6, 0))
+
+        if auto_read and prefill_address:
+            top.after(0, _read)
+
+    def _hf_auto_blocked(self):
+        """hard_freeze's "Auto" button: compute_min_steal answers a jmp-hook
+        question (pointer_capture's steal length), not "where is the
+        instruction I want to freeze/NOP" -- there is no relationship between
+        the two, so it must never write into hard_freeze's Offset field (see
+        engine.build_hard_freeze_candidate_from_address's docstring, and the
+        POP_test.json "Infinite Rewind" mismatch that surfaced this: correct
+        offset=11/nop_len=6, but compute_min_steal gave 7 (rel32) or 17
+        (absolute) -- neither matches). Use "From address..." instead, which
+        now calls the real fix."""
+        self.form_error_var.set(
+            "Auto-steal doesn't apply to hard_freeze — use From address... "
+            "to auto-locate the target instruction instead.")
 
     def _paste_line(self, entry, offset_var=_USE_STRUCT_OFFSET):
         """Offline dialog: paste a disassembly line, fill register + offset.

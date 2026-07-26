@@ -157,6 +157,26 @@ class MidInstructionStealError(Exception):
         )
 
 
+class HardFreezeUniquenessError(Exception):
+    """Raised by build_hard_freeze_candidate_from_address when walking the AOB
+    backward by whole instructions still hasn't produced a unique match within
+    the allowed context window. Means the bytes around the target instruction
+    recur elsewhere in the module (or the walk hit unresolvable bytes); the
+    user should try a different address or build the AOB manually."""
+
+    def __init__(self, context_bytes, max_context_bytes, matches):
+        self.context_bytes = context_bytes
+        self.max_context_bytes = max_context_bytes
+        self.matches = matches         # -1 if a read/decode failure stopped us
+        detail = ("still {} match(es)".format(matches) if matches >= 0
+                  else "a read/decode failure")
+        super().__init__(
+            "Could not reach a unique AOB within {} byte(s) of backward "
+            "context (limit {}) -- {}. Try a different address, or build "
+            "the AOB manually.".format(context_bytes, max_context_bytes, detail)
+        )
+
+
 def _parse_int(value, default=0):
     """Parse an int that may be given as an int or a hex/dec string."""
     if value is None:
@@ -770,6 +790,51 @@ class TrainerEngine:
             raise MidInstructionStealError(steal, lo, hi, bounds)
         return bounds  # steal >= last boundary: beyond decoded AOB, unverifiable
 
+    def _locate_instruction_boundary(self, target_addr,
+                                     lookback_sizes=(24, 16, 12, 8, 6, 4, 3, 2)):
+        """Find the instruction that ends exactly at `target_addr`.
+
+        x86 can't be disassembled backwards, so this anchors a few bytes
+        earlier and disassembles forward; whichever anchor produces an
+        instruction stream landing exactly on target_addr identifies the real
+        instruction boundary. Prefers the farthest-back anchor that lands
+        cleanly -- the longer the validated stream, the less likely it decoded
+        mid-instruction garbage.
+
+        Shared by DebugSession._resolve_writer (resolving what wrote to a Find
+        Writes address) and build_hard_freeze_candidate_from_address (walking
+        an AOB backward by whole instructions) -- the same problem in both
+        cases: given an address that is the END of some instruction, find
+        where that instruction starts.
+
+        Returns the capstone instruction ending at target_addr, or None if it
+        can't be resolved from the available bytes.
+        """
+        blob, window = None, 0
+        for size in lookback_sizes:
+            data = self._read(target_addr - size, size)
+            if data:
+                blob, window = data, size
+                break
+        if not blob:
+            return None
+        start = target_addr - window
+        md = self._make_disassembler()
+        for back in range(window, 1, -1):
+            anchor = target_addr - back
+            offset = anchor - start
+            stream = list(md.disasm(bytes(blob[offset:]), anchor))
+            if not stream:
+                continue
+            last = None
+            for insn in stream:
+                if insn.address >= target_addr:
+                    break
+                last = insn
+            if last is not None and last.address + last.size == target_addr:
+                return last
+        return None
+
     def _module_for_address(self, address):
         """Return (module_name_or_None, base, size) for the module containing
         `address`. module_name is None when it's the main executable module
@@ -875,6 +940,126 @@ class TrainerEngine:
             "capture_register": reg,
             "struct_offset": offset_str,
             "reason": reason,
+            "instructions": instructions,
+        }
+
+    def build_hard_freeze_candidate_from_address(self, address,
+                                                 max_context_before=128):
+        """Build a hard_freeze AOB/offset/nop_len candidate from a live address.
+
+        hard_freeze has NO jmp/code-cave concept -- apply_hard_freeze() just
+        writes bytes in place (target = match_address + offset, then either a
+        4-byte value or nop_len 0x90 bytes at that target). So unlike
+        build_candidate_from_address (used for pointer_capture hooks, whose
+        struct_offset/register describe a memory operand and whose companion
+        Auto-steal button computes a jmp-sized steal length), this function
+        answers a different question entirely: "starting from a unique AOB
+        anchored somewhere before `address`, how far in is the instruction I
+        actually want to freeze/NOP, and how long is it?" There is no
+        jmp-size threshold involved anywhere in this computation.
+
+        `address` is expected to already be an instruction START address (as
+        copied from Cheat Engine, or from a Find Writes hit, whose reported
+        address is itself resolved to an instruction boundary). Steps:
+
+          1. Disassemble forward from `address` to get the target
+             instruction's own length -> nop_len.
+          2. Walk backward from `address` ONE WHOLE INSTRUCTION at a time
+             (never a raw byte count), extending the AOB and re-checking
+             scan_aob uniqueness in the owning module after each step -- the
+             backward mirror of build_candidate_from_address's forward
+             extension-for-uniqueness loop. x86 can't be disassembled
+             backwards, so each backward step reuses
+             _locate_instruction_boundary -- the same anchor-and-disassemble-
+             forward technique _resolve_writer uses for Find Writes hits.
+          3. offset = the distance from the AOB's start to `address` (the
+             length of that prepended context).
+
+        Raises HardFreezeUniquenessError if uniqueness can't be reached within
+        max_context_before bytes of backward context (mirrors compute_min_
+        steal raising InsufficientBytesForJmpError when it runs out of AOB) --
+        this fails clearly rather than silently returning a non-unique match.
+
+        Returns a dict shaped like build_candidate_from_address's: aob,
+        matches, module, offset, nop_len, instructions -- or {"error": "..."}
+        for setup failures (not attached, bad address, can't read/disassemble).
+        """
+        if self.pm is None:
+            return {"error": "Not attached — attach to the game first."}
+        try:
+            address = int(address)
+        except (TypeError, ValueError):
+            return {"error": "Invalid address."}
+
+        # 1. Decode the target instruction itself; its length becomes nop_len.
+        # 16 bytes covers the longest possible x86 instruction (15 bytes) with
+        # a byte to spare.
+        raw = self._read(address, 16)
+        if not raw:
+            return {"error": "Could not read bytes at {:#x}.".format(address)}
+        try:
+            md = self._make_disassembler()
+        except RuntimeError as exc:
+            return {"error": str(exc)}
+        target_insns = list(md.disasm(bytes(raw), address))
+        if not target_insns or target_insns[0].address != address:
+            return {"error": "Could not disassemble a clean instruction at "
+                            "{:#x} -- is this really an instruction start?"
+                            .format(address)}
+        nop_len = target_insns[0].size
+
+        # Scan the module that actually contains this address (so uniqueness
+        # is checked, and the mod later scans, against the right module).
+        module_name, _base, _size = self._module_for_address(address)
+
+        # 2. Walk backward one whole instruction at a time, checking
+        # uniqueness after each step (including the zero-context case: just
+        # the target instruction alone might already be unique).
+        aob_start = address
+        end_addr = address + nop_len
+        matches = None
+        aob_hex = ""
+        while True:
+            span = end_addr - aob_start
+            raw_span = self._read(aob_start, span)
+            if raw_span and len(raw_span) == span:
+                aob_hex = " ".join("{:02X}".format(b) for b in raw_span)
+                matches = len(self.scan_aob(aob_hex, module_name=module_name))
+                if matches == 1:
+                    break
+            context_used = address - aob_start
+            if context_used >= max_context_before:
+                raise HardFreezeUniquenessError(
+                    context_used, max_context_before,
+                    matches if matches is not None else -1)
+            prev_insn = self._locate_instruction_boundary(aob_start)
+            if prev_insn is None:
+                raise HardFreezeUniquenessError(
+                    context_used, max_context_before,
+                    matches if matches is not None else -1)
+            aob_start = prev_insn.address
+
+        offset = address - aob_start
+
+        # Re-disassemble the final (unique) AOB span for the preview listing
+        # -- context instructions in order, ending with the target.
+        final_insns = list(md.disasm(bytes(raw_span), aob_start))
+        instructions = [
+            {
+                "address": "0x{:X}".format(insn.address),
+                "text": "{} {}".format(insn.mnemonic, insn.op_str).strip(),
+                "bytes": " ".join("{:02X}".format(b) for b in insn.bytes),
+                "size": insn.size,
+            }
+            for insn in final_insns
+        ]
+
+        return {
+            "aob": aob_hex,
+            "matches": matches,
+            "module": module_name,
+            "offset": offset,
+            "nop_len": nop_len,
             "instructions": instructions,
         }
 
@@ -2807,44 +2992,16 @@ class DebugSession:
         """Find the instruction that performed the write.
 
         A data breakpoint traps AFTER the storing instruction retires, so the
-        reported IP is the address of the NEXT instruction. x86 can't be
-        disassembled backwards directly, so anchor a few bytes earlier and
-        disassemble forward; whichever anchor produces an instruction stream
-        landing exactly on next_ip identifies the real instruction boundary.
-        Prefer the farthest-back anchor that lands cleanly -- the longer the
-        validated stream, the less likely it decoded mid-instruction garbage.
+        reported IP is the address of the NEXT instruction. Delegates the
+        actual backward resolution to TrainerEngine._locate_instruction_
+        boundary -- the anchor-and-disassemble-forward technique, shared with
+        build_hard_freeze_candidate_from_address rather than duplicated here.
+        (self._is64 is kept in sync with self.engine._is64 at start(), so
+        using the engine's own disassembler here is equivalent to before.)
 
         Returns (address, text, bytes_hex) for the writer, or None.
         """
-        # Try the widest lookback first, then shrink. The read can fail
-        # outright when next_ip sits near the start of its region (the window
-        # would cross into unmapped memory), which must not cost us the hit --
-        # a smaller window still resolves the instruction.
-        blob, window = None, 0
-        for size in (24, 16, 12, 8, 6, 4, 3, 2):
-            data = self.engine._read(next_ip - size, size)
-            if data:
-                blob, window = data, size
-                break
-        if not blob:
-            return None
-        start = next_ip - window
-        md = self.engine._make_disassembler(self._is64)
-        best = None
-        for back in range(window, 1, -1):
-            anchor = next_ip - back
-            offset = anchor - start
-            stream = list(md.disasm(bytes(blob[offset:]), anchor))
-            if not stream:
-                continue
-            last = None
-            for insn in stream:
-                if insn.address >= next_ip:
-                    break
-                last = insn
-            if last is not None and last.address + last.size == next_ip:
-                best = last
-                break                       # farthest-back clean landing wins
+        best = self.engine._locate_instruction_boundary(next_ip)
         if best is None:
             return None
         return (best.address,
